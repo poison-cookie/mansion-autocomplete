@@ -17,6 +17,7 @@
 (function () {
   'use strict';
 
+  // 保存キー。既存ユーザーのデータを引き継ぐため、古い mansionAutocomplete 名は変更しない。
   const SITE_PHRASES_KEY = 'mansionAutocomplete.sitePhrases.v1';
   const HISTORY_KEY = 'mansionAutocomplete.history.v1';
   const PINNED_KEY = 'mansionAutocomplete.pinned.v1';
@@ -31,6 +32,7 @@
   const RECORD_DEDUPE_MS = 900;
   const ACTION_BUTTON_PATTERN = /検索|決定|確定|送信|登録|保存|次へ|反映|search|submit|ok/i;
 
+  // このスクリプトはサイトごとに候補・使用回数・ピン止め状態を分けて保存する。
   const siteKey = location.hostname || location.host || 'unknown-site';
   let sitePhrases = loadSitePhrases();
   let history = loadHistory();
@@ -73,6 +75,7 @@
   popup.hidden = true;
   popup.setAttribute('role', 'listbox');
 
+  // Shadow DOM 内にUIを作ることで、サイト側CSSの影響を受けにくくする。
   const style = document.createElement('style');
   style.textContent = `
     :host {
@@ -434,6 +437,7 @@
   document.documentElement.appendChild(uiHost);
 
   if (typeof GM_registerMenuCommand === 'function') {
+    // Tampermonkey の拡張機能メニューからも主要操作を実行できるようにする。
     GM_registerMenuCommand('設定画面を開く', openManager);
     GM_registerMenuCommand('このサイトで有効/無効を切り替え', toggleSiteEnabled);
     GM_registerMenuCommand('入力モードを切り替え', toggleInputMode);
@@ -445,6 +449,7 @@
 
   managerButton.addEventListener('click', openManager);
 
+  // 入力欄にフォーカスしたら候補ポップアップを表示する。
   document.addEventListener('focusin', (event) => {
     if (isSiteDisabled()) return;
     if (isTextEntry(event.target)) {
@@ -507,6 +512,7 @@
     }
   }, true);
 
+  // 外側をクリックしたら候補ポップアップを閉じる。
   document.addEventListener('mousedown', (event) => {
     if (isOwnUiEvent(event)) return;
     if (isSiteDisabled()) return;
@@ -515,12 +521,14 @@
     }
   }, true);
 
+  // フォーム送信時に入力値を候補へ追加し、使用回数を+1する。
   document.addEventListener('submit', (event) => {
     if (isOwnUiEvent(event)) return;
     if (isSiteDisabled()) return;
     recordEntriesForAction(event.target);
   }, true);
 
+  // 検索・決定・保存などのボタン押下でも使用回数を記録する。
   document.addEventListener('click', (event) => {
     if (isOwnUiEvent(event)) return;
     if (isSiteDisabled()) return;
@@ -538,6 +546,9 @@
   window.addEventListener('resize', positionPopup);
   window.addEventListener('scroll', positionPopup, true);
 
+  // --- 保存データの読み書き -------------------------------------------------
+  // 候補、使用回数、ピン止め、サイト別ON/OFFなどを Tampermonkey storage に保存する。
+  // Tampermonkey API が使えない検証環境では localStorage にフォールバックする。
   function loadSitePhrases() {
     const saved = readValue(SITE_PHRASES_KEY, {});
     return saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
@@ -700,6 +711,7 @@
     }
   }
 
+  // --- Tampermonkeyメニューから呼ぶ操作 ------------------------------------
   function editPhrases() {
     const currentPhrases = getCurrentSitePhrases();
     const nextText = window.prompt(
@@ -781,6 +793,7 @@
     return inputMode === 'typing' ? 'キーボード入力風' : '標準';
   }
 
+  // --- 入力欄・候補検索の基本処理 ------------------------------------------
   function uniqueNonEmpty(items) {
     return [...new Set(items.map((item) => item.trim()).filter(Boolean))];
   }
@@ -876,6 +889,7 @@
     return String(value || '').trim().normalize('NFKC').toLowerCase();
   }
 
+  // 検索専用の正規化。全角半角、空白、ハイフン、ひらがな/カタカナなどの表記ゆれを吸収する。
   function buildSearchQuery(value) {
     const normalized = normalize(value);
     const tokens = normalized
@@ -907,6 +921,7 @@
     return path.includes(uiHost) || path.includes(manager) || path.includes(popup) || path.includes(managerButton);
   }
 
+  // Chrome標準オートコンプリートが被りにくいよう、フォーカス中だけ属性を書き換える。
   function applyNativeAutocompleteSuppression(element) {
     if (!suppressNativeAutocomplete || !element || entryAttributeRestores.has(element)) return;
     if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) return;
@@ -939,6 +954,8 @@
     entryAttributeRestores.delete(element);
   }
 
+  // --- 候補ポップアップ -----------------------------------------------------
+  // 入力欄の下に候補を表示し、選択・ピン止め・コピー・入力クリアを処理する。
   function renderPopup() {
     popup.textContent = '';
 
@@ -1170,6 +1187,8 @@
     }
   }
 
+  // --- 設定画面 -------------------------------------------------------------
+  // 右下の「設定」ボタンから開く管理画面。候補追加、CSV入出力、検索、ピン止め、削除を行う。
   function openManager() {
     hidePopup();
     renderManager();
@@ -1546,6 +1565,8 @@
     return item;
   }
 
+  // --- CSVインポート / エクスポート ----------------------------------------
+  // Excel由来のShift-JIS/CP932やUTF-8 BOM付きCSVを読み、候補・使用回数・ピン状態を取り込む。
   async function importPhrasesFromCsv(file) {
     try {
       const text = await readCsvFileText(file);
@@ -1885,6 +1906,8 @@
       : `${Math.max(viewportGap, aboveTop)}px`;
   }
 
+  // --- 入力欄への反映 -------------------------------------------------------
+  // 通常入力欄、textarea、contenteditable に値を入れ、サイト側が検知できる input/change も発火する。
   function commit(value) {
     if (!activeInput) return;
 
@@ -2016,6 +2039,8 @@
     selection.addRange(range);
   }
 
+  // --- 使用回数の記録 -------------------------------------------------------
+  // 候補を選んだだけでは増やさず、検索・決定・送信などの実行時だけ+1する。
   function recordValue(rawValue) {
     const value = String(rawValue || '').trim();
     if (value.length < MIN_RECORD_LENGTH) return;
@@ -2130,6 +2155,7 @@
     );
   }
 
+  // ポップアップを閉じる時は選択状態と開いている「…」メニューもリセットする。
   function hidePopup() {
     popup.hidden = true;
     matches = [];
