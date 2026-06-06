@@ -20,6 +20,8 @@
   const PHRASES_KEY = 'mansionAutocomplete.phrases.v2';
   const HISTORY_KEY = 'mansionAutocomplete.history.v1';
   const INPUT_MODE_KEY = 'mansionAutocomplete.inputMode.v1';
+  const SUPPRESS_NATIVE_KEY = 'mansionAutocomplete.suppressNative.v1';
+  const DISABLED_SITES_KEY = 'mansionAutocomplete.disabledSites.v1';
   const MAX_RESULTS = 12;
   const MAX_HISTORY_PER_SITE = 200;
   const MIN_RECORD_LENGTH = 2;
@@ -36,13 +38,23 @@
   let matches = [];
   let isComposingText = false;
   let inputMode = loadInputMode();
+  let suppressNativeAutocomplete = loadSuppressNativeAutocomplete();
+  let disabledSites = loadDisabledSites();
   const recentRecords = new Map();
+  const entryAttributeRestores = new WeakMap();
+  let lastPopupCommit = { value: '', at: 0 };
+  let lastCopyCommit = { value: '', at: 0 };
+  let copiedMessage = '';
+
+  const uiHost = document.createElement('div');
+  uiHost.id = 'mansion-autocomplete-ui-host';
+  const uiRoot = uiHost.attachShadow({ mode: 'open' });
 
   const managerButton = document.createElement('button');
   managerButton.id = 'mansion-autocomplete-manager-button';
   managerButton.type = 'button';
-  managerButton.textContent = '候補';
-  managerButton.title = 'マンション名候補を管理';
+  managerButton.textContent = '設定';
+  managerButton.title = 'マンション名候補の設定';
 
   const manager = document.createElement('div');
   manager.id = 'mansion-autocomplete-manager';
@@ -55,6 +67,21 @@
 
   const style = document.createElement('style');
   style.textContent = `
+    :host {
+      all: initial;
+      color-scheme: light;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+    }
+    button,
+    input,
+    textarea {
+      font: inherit;
+    }
     #mansion-autocomplete-popup {
       position: fixed;
       z-index: 2147483647;
@@ -69,13 +96,12 @@
       background: #fff;
       color: #111827;
       box-shadow: 0 10px 28px rgba(15, 23, 42, 0.22);
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 14px;
       line-height: 1.35;
     }
     #mansion-autocomplete-popup .mac-item {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-columns: minmax(0, 1fr) auto auto auto;
       gap: 8px;
       align-items: center;
       padding: 7px 9px;
@@ -92,6 +118,7 @@
       font-size: 12px;
       white-space: nowrap;
     }
+    #mansion-autocomplete-popup .mac-copy,
     #mansion-autocomplete-popup .mac-delete {
       display: inline-grid;
       place-items: center;
@@ -105,6 +132,10 @@
       font-size: 15px;
       line-height: 1;
     }
+    #mansion-autocomplete-popup .mac-copy:hover {
+      background: #dbeafe;
+      color: #1d4ed8;
+    }
     #mansion-autocomplete-popup .mac-delete:hover {
       background: #fee2e2;
       color: #b91c1c;
@@ -116,8 +147,13 @@
     #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-meta {
       color: #dbeafe;
     }
+    #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-copy,
     #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-delete {
       color: #dbeafe;
+    }
+    #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-copy:hover {
+      background: #dbeafe;
+      color: #1d4ed8;
     }
     #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-delete:hover {
       background: #fee2e2;
@@ -130,6 +166,14 @@
       border-top: 1px solid #e5e7eb;
       margin-top: 3px;
     }
+    #mansion-autocomplete-popup .mac-toast {
+      padding: 5px 9px;
+      color: #166534;
+      font-size: 12px;
+      background: #dcfce7;
+      border-radius: 4px;
+      margin: 3px 0;
+    }
     #mansion-autocomplete-manager-button {
       position: fixed;
       right: 14px;
@@ -140,7 +184,9 @@
       padding: 9px 13px;
       background: #1d4ed8;
       color: #fff;
-      font: 600 13px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1;
       box-shadow: 0 8px 24px rgba(15, 23, 42, 0.22);
       cursor: pointer;
     }
@@ -152,7 +198,6 @@
       padding: 18px;
       background: rgba(15, 23, 42, 0.35);
       color: #111827;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     #mansion-autocomplete-manager .mac-manager-panel {
       width: min(760px, 100%);
@@ -224,7 +269,9 @@
       padding: 8px 11px;
       background: #fff;
       color: #111827;
-      font: 600 13px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.2;
       cursor: pointer;
       white-space: nowrap;
     }
@@ -282,14 +329,17 @@
     }
   `;
 
-  document.documentElement.appendChild(style);
-  document.documentElement.appendChild(managerButton);
-  document.documentElement.appendChild(manager);
-  document.documentElement.appendChild(popup);
+  uiRoot.appendChild(style);
+  uiRoot.appendChild(managerButton);
+  uiRoot.appendChild(manager);
+  uiRoot.appendChild(popup);
+  document.documentElement.appendChild(uiHost);
 
   if (typeof GM_registerMenuCommand === 'function') {
-    GM_registerMenuCommand('管理画面を開く', openManager);
+    GM_registerMenuCommand('設定画面を開く', openManager);
+    GM_registerMenuCommand('このサイトで有効/無効を切り替え', toggleSiteEnabled);
     GM_registerMenuCommand('入力モードを切り替え', toggleInputMode);
+    GM_registerMenuCommand('Chrome候補抑制を切り替え', toggleSuppressNativeAutocomplete);
     GM_registerMenuCommand('候補リストを編集', editPhrases);
     GM_registerMenuCommand('候補リストを初期化', resetPhrases);
     GM_registerMenuCommand('このサイトの入力履歴を削除', clearSiteHistory);
@@ -299,13 +349,22 @@
   managerButton.addEventListener('click', openManager);
 
   document.addEventListener('focusin', (event) => {
+    if (isSiteDisabled()) return;
     if (isTextEntry(event.target)) {
       activeInput = event.target;
+      applyNativeAutocompleteSuppression(activeInput);
       updatePopup();
     }
   });
 
+  document.addEventListener('blur', (event) => {
+    if (event.target === activeInput) {
+      restoreEntryAttributes(event.target);
+    }
+  }, true);
+
   document.addEventListener('input', (event) => {
+    if (isSiteDisabled()) return;
     if (event.target === activeInput) {
       if (isComposingText || event.isComposing) return;
       updatePopup();
@@ -313,6 +372,7 @@
   });
 
   document.addEventListener('compositionstart', (event) => {
+    if (isSiteDisabled()) return;
     if (event.target === activeInput) {
       isComposingText = true;
       hidePopup();
@@ -320,6 +380,7 @@
   });
 
   document.addEventListener('compositionend', (event) => {
+    if (isSiteDisabled()) return;
     if (event.target === activeInput) {
       isComposingText = false;
       updatePopup();
@@ -327,6 +388,7 @@
   });
 
   document.addEventListener('keydown', (event) => {
+    if (isSiteDisabled()) return;
     if (event.isComposing || isComposingText || !activeInput || popup.hidden) return;
 
     if (event.key === 'ArrowDown') {
@@ -348,22 +410,28 @@
   }, true);
 
   document.addEventListener('mousedown', (event) => {
-    if (!popup.contains(event.target) && event.target !== activeInput) {
+    if (isOwnUiEvent(event)) return;
+    if (isSiteDisabled()) return;
+    if (event.target !== activeInput) {
       hidePopup();
     }
   }, true);
 
   document.addEventListener('submit', (event) => {
-    if (manager.contains(event.target)) return;
+    if (isOwnUiEvent(event)) return;
+    if (isSiteDisabled()) return;
     recordEntriesForAction(event.target);
   }, true);
 
   document.addEventListener('click', (event) => {
+    if (isOwnUiEvent(event)) return;
+    if (isSiteDisabled()) return;
+
     const action = event.target.closest && event.target.closest(
       'button, input[type="submit"], input[type="button"], input[type="image"], [role="button"]'
     );
 
-    if (!action || manager.contains(action) || popup.contains(action)) return;
+    if (!action) return;
     if (!isActionButton(action)) return;
 
     recordEntriesForAction(action);
@@ -393,6 +461,23 @@
   function loadInputMode() {
     const saved = readValue(INPUT_MODE_KEY, 'setter');
     return saved === 'typing' ? 'typing' : 'setter';
+  }
+
+  function loadSuppressNativeAutocomplete() {
+    return readValue(SUPPRESS_NATIVE_KEY, true) !== false;
+  }
+
+  function loadDisabledSites() {
+    const saved = readValue(DISABLED_SITES_KEY, []);
+    return Array.isArray(saved) ? saved.filter((item) => typeof item === 'string') : [];
+  }
+
+  function saveDisabledSites() {
+    writeValue(DISABLED_SITES_KEY, [...new Set(disabledSites)]);
+  }
+
+  function isSiteDisabled() {
+    return disabledSites.includes(siteKey);
   }
 
   function saveHistory() {
@@ -470,6 +555,31 @@
     window.alert(`入力モードを「${inputModeLabel()}」にしました。`);
   }
 
+  function toggleSiteEnabled() {
+    setSiteDisabled(!isSiteDisabled());
+    window.alert(`${siteKey} での機能を「${isSiteDisabled() ? '無効' : '有効'}」にしました。`);
+  }
+
+  function setSiteDisabled(disabled) {
+    if (disabled) {
+      disabledSites = [...new Set(disabledSites.concat(siteKey))];
+      hidePopup();
+      if (activeInput) restoreEntryAttributes(activeInput);
+    } else {
+      disabledSites = disabledSites.filter((item) => item !== siteKey);
+      if (activeInput && isTextEntry(activeInput)) {
+        applyNativeAutocompleteSuppression(activeInput);
+      }
+    }
+    saveDisabledSites();
+  }
+
+  function toggleSuppressNativeAutocomplete() {
+    suppressNativeAutocomplete = !suppressNativeAutocomplete;
+    writeValue(SUPPRESS_NATIVE_KEY, suppressNativeAutocomplete);
+    window.alert(`Chrome候補抑制を「${suppressNativeAutocomplete ? '有効' : '無効'}」にしました。`);
+  }
+
   function inputModeLabel() {
     return inputMode === 'typing' ? 'キーボード入力風' : '標準';
   }
@@ -480,7 +590,7 @@
 
   function isTextEntry(element) {
     if (!element || element.disabled || element.readOnly) return false;
-    if (element.closest && element.closest('#mansion-autocomplete-manager')) return false;
+    if (uiHost.contains(element) || manager.contains(element)) return false;
     if (element instanceof HTMLTextAreaElement) return true;
     if (element instanceof HTMLElement && element.isContentEditable) return true;
     if (!(element instanceof HTMLInputElement)) return false;
@@ -584,6 +694,43 @@
     return String(value || '').trim().normalize('NFKC').toLowerCase();
   }
 
+  function isOwnUiEvent(event) {
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    return path.includes(uiHost) || path.includes(manager) || path.includes(popup) || path.includes(managerButton);
+  }
+
+  function applyNativeAutocompleteSuppression(element) {
+    if (!suppressNativeAutocomplete || !element || entryAttributeRestores.has(element)) return;
+    if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) return;
+
+    const attrs = ['autocomplete', 'autocorrect', 'autocapitalize', 'spellcheck', 'aria-autocomplete'];
+    const restore = {};
+    attrs.forEach((attr) => {
+      restore[attr] = element.hasAttribute(attr) ? element.getAttribute(attr) : null;
+    });
+    entryAttributeRestores.set(element, restore);
+
+    element.setAttribute('autocomplete', 'off');
+    element.setAttribute('autocorrect', 'off');
+    element.setAttribute('autocapitalize', 'off');
+    element.setAttribute('spellcheck', 'false');
+    element.setAttribute('aria-autocomplete', 'none');
+  }
+
+  function restoreEntryAttributes(element) {
+    const restore = entryAttributeRestores.get(element);
+    if (!restore) return;
+
+    Object.entries(restore).forEach(([attr, value]) => {
+      if (value === null) {
+        element.removeAttribute(attr);
+      } else {
+        element.setAttribute(attr, value);
+      }
+    });
+    entryAttributeRestores.delete(element);
+  }
+
   function renderPopup() {
     popup.textContent = '';
 
@@ -600,6 +747,24 @@
       const meta = document.createElement('div');
       meta.className = 'mac-meta';
       meta.textContent = match.source === '履歴' ? `履歴 ${match.count}回` : '候補';
+
+      const copyButton = document.createElement('button');
+      copyButton.className = 'mac-copy';
+      copyButton.type = 'button';
+      copyButton.title = `${match.value} をコピー`;
+      copyButton.setAttribute('aria-label', `${match.value} を入力してコピー`);
+      copyButton.textContent = '⧉';
+      const copyAndInputFromPopup = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        commitAndCopy(match.value);
+      };
+      copyButton.addEventListener('pointerdown', copyAndInputFromPopup);
+      copyButton.addEventListener('mousedown', copyAndInputFromPopup);
+      copyButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
 
       const deleteButton = document.createElement('button');
       deleteButton.className = 'mac-delete';
@@ -620,23 +785,29 @@
       });
 
       item.appendChild(name);
+      item.appendChild(copyButton);
       item.appendChild(meta);
       item.appendChild(deleteButton);
       item.addEventListener('mouseenter', () => {
         selectedIndex = index;
         renderPopup();
       });
-      item.addEventListener('mousedown', (event) => {
-        if (event.target.closest && event.target.closest('.mac-delete')) return;
-        event.preventDefault();
-        commit(match.value);
-      });
+      item.addEventListener('pointerdown', (event) => commitFromPopup(event, match.value));
+      item.addEventListener('mousedown', (event) => commitFromPopup(event, match.value));
+      item.addEventListener('click', (event) => commitFromPopup(event, match.value));
       popup.appendChild(item);
     });
 
+    if (copiedMessage) {
+      const toast = document.createElement('div');
+      toast.className = 'mac-toast';
+      toast.textContent = copiedMessage;
+      popup.appendChild(toast);
+    }
+
     const help = document.createElement('div');
     help.className = 'mac-help';
-    help.textContent = '↑↓で選択 / Enter・Tabで入力 / 検索・決定ボタンで履歴に保存';
+    help.textContent = '↑↓で選択 / Enter・Tab・クリックで入力 / ⧉で入力+コピー';
     popup.appendChild(help);
   }
 
@@ -662,6 +833,54 @@
       delete history[siteKey];
     }
     saveHistory();
+  }
+
+  async function copyValue(value) {
+    copiedMessage = 'コピー中...';
+    renderPopup();
+
+    const ok = await writeClipboard(value);
+    copiedMessage = ok ? 'コピーしました' : 'コピーできませんでした';
+    renderPopup();
+
+    window.setTimeout(() => {
+      if (!copiedMessage) return;
+      copiedMessage = '';
+      if (!popup.hidden) renderPopup();
+    }, 1200);
+  }
+
+  async function writeClipboard(value) {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(value);
+        return true;
+      }
+    } catch (_) {
+      // Fall back below.
+    }
+
+    return copyWithTextarea(value);
+  }
+
+  function copyWithTextarea(value) {
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    textarea.style.top = '0';
+    document.documentElement.appendChild(textarea);
+
+    try {
+      textarea.select();
+      return document.execCommand && document.execCommand('copy');
+    } catch (_) {
+      return false;
+    } finally {
+      textarea.remove();
+      if (activeInput) activeInput.focus();
+    }
   }
 
   function openManager() {
@@ -704,7 +923,9 @@
     const body = document.createElement('div');
     body.className = 'mac-manager-body';
 
+    body.appendChild(createSiteEnabledSection());
     body.appendChild(createModeSection());
+    body.appendChild(createSuppressSection());
     body.appendChild(createAddSection());
     body.appendChild(createPhraseSection());
     body.appendChild(createHistorySection(sortedHistory));
@@ -714,6 +935,30 @@
     manager.appendChild(panel);
 
     manager.addEventListener('mousedown', closeManager, { once: true });
+  }
+
+  function createSiteEnabledSection() {
+    const section = document.createElement('section');
+    const box = document.createElement('div');
+    box.className = 'mac-mode';
+
+    const text = document.createElement('div');
+    text.className = 'mac-mode-text';
+    text.textContent = `このサイト: ${isSiteDisabled() ? '無効' : '有効'} (${siteKey})`;
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = isSiteDisabled() ? 'mac-primary' : 'mac-danger';
+    button.textContent = isSiteDisabled() ? '有効にする' : '無効にする';
+    button.addEventListener('click', () => {
+      setSiteDisabled(!isSiteDisabled());
+      renderManager();
+    });
+
+    box.appendChild(text);
+    box.appendChild(button);
+    section.appendChild(box);
+    return section;
   }
 
   function createModeSection() {
@@ -731,6 +976,37 @@
     button.addEventListener('click', () => {
       inputMode = inputMode === 'setter' ? 'typing' : 'setter';
       writeValue(INPUT_MODE_KEY, inputMode);
+      renderManager();
+    });
+
+    box.appendChild(text);
+    box.appendChild(button);
+    section.appendChild(box);
+    return section;
+  }
+
+  function createSuppressSection() {
+    const section = document.createElement('section');
+    const box = document.createElement('div');
+    box.className = 'mac-mode';
+
+    const text = document.createElement('div');
+    text.className = 'mac-mode-text';
+    text.textContent = `Chrome候補抑制: ${suppressNativeAutocomplete ? '有効' : '無効'}`;
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = '切り替え';
+    button.addEventListener('click', () => {
+      suppressNativeAutocomplete = !suppressNativeAutocomplete;
+      writeValue(SUPPRESS_NATIVE_KEY, suppressNativeAutocomplete);
+      if (activeInput) {
+        if (suppressNativeAutocomplete) {
+          applyNativeAutocompleteSuppression(activeInput);
+        } else {
+          restoreEntryAttributes(activeInput);
+        }
+      }
       renderManager();
     });
 
@@ -903,10 +1179,11 @@
     )}px`;
 
     const popupHeight = popup.offsetHeight || 240;
+    const aboveTop = rect.top - popupHeight - 4;
     const fitsBelow = belowTop + popupHeight < window.innerHeight - viewportGap;
     popup.style.top = fitsBelow
       ? `${belowTop}px`
-      : `${Math.max(viewportGap, rect.top - popupHeight - 4)}px`;
+      : `${Math.max(viewportGap, aboveTop)}px`;
   }
 
   function commit(value) {
@@ -914,6 +1191,31 @@
 
     setEntryValue(activeInput, value, inputMode);
     hidePopup();
+  }
+
+  async function commitAndCopy(value) {
+    const now = Date.now();
+    if (lastCopyCommit.value === value && now - lastCopyCommit.at < 250) return;
+    lastCopyCommit = { value, at: now };
+
+    if (activeInput) {
+      setEntryValue(activeInput, value, inputMode);
+    }
+
+    await copyValue(value);
+  }
+
+  function commitFromPopup(event, value) {
+    if (event.target.closest && event.target.closest('.mac-delete, .mac-copy')) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const now = Date.now();
+    if (lastPopupCommit.value === value && now - lastPopupCommit.at < 250) return;
+
+    lastPopupCommit = { value, at: now };
+    commit(value);
   }
 
   function getEntryValue(element) {
@@ -927,6 +1229,7 @@
   }
 
   function setEntryValue(element, value, mode) {
+    applyNativeAutocompleteSuppression(element);
     element.focus();
 
     if (mode === 'typing') {
