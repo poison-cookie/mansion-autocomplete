@@ -1,0 +1,10 @@
+# Browser/test artifacts
+.playwright-mcp/
+
+# Local source data and editable document drafts
+*.csv
+*.docx
+
+# OS/editor noise
+Thumbs.db
+.DS_Store
