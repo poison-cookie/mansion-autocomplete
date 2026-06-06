@@ -22,8 +22,10 @@
   const INPUT_MODE_KEY = 'mansionAutocomplete.inputMode.v1';
   const SUPPRESS_NATIVE_KEY = 'mansionAutocomplete.suppressNative.v1';
   const DISABLED_SITES_KEY = 'mansionAutocomplete.disabledSites.v1';
+  const HISTORY_LIMIT_KEY = 'mansionAutocomplete.historyLimit.v1';
   const MAX_RESULTS = 12;
-  const MAX_HISTORY_PER_SITE = 200;
+  const DEFAULT_HISTORY_LIMIT_PER_SITE = 5000;
+  const HISTORY_LIMIT_OPTIONS = [500, 1000, 3000, 5000, 10000];
   const MIN_RECORD_LENGTH = 2;
   const RECORD_DEDUPE_MS = 900;
   const ACTION_BUTTON_PATTERN = /検索|決定|確定|送信|登録|保存|次へ|反映|search|submit|ok/i;
@@ -40,6 +42,7 @@
   let inputMode = loadInputMode();
   let suppressNativeAutocomplete = loadSuppressNativeAutocomplete();
   let disabledSites = loadDisabledSites();
+  let historyLimitPerSite = loadHistoryLimitPerSite();
   const recentRecords = new Map();
   const entryAttributeRestores = new WeakMap();
   let lastPopupCommit = { value: '', at: 0 };
@@ -254,14 +257,22 @@
       display: flex;
       gap: 8px;
     }
-    #mansion-autocomplete-manager input {
+    #mansion-autocomplete-manager input,
+    #mansion-autocomplete-manager select {
       min-width: 0;
-      flex: 1;
       box-sizing: border-box;
       border: 1px solid #aeb8c7;
       border-radius: 6px;
       padding: 9px 10px;
       font: inherit;
+    }
+    #mansion-autocomplete-manager input {
+      flex: 1;
+    }
+    #mansion-autocomplete-manager select {
+      min-width: 128px;
+      background: #fff;
+      color: #111827;
     }
     #mansion-autocomplete-manager button {
       border: 1px solid #cbd5e1;
@@ -470,6 +481,11 @@
   function loadDisabledSites() {
     const saved = readValue(DISABLED_SITES_KEY, []);
     return Array.isArray(saved) ? saved.filter((item) => typeof item === 'string') : [];
+  }
+
+  function loadHistoryLimitPerSite() {
+    const saved = Number(readValue(HISTORY_LIMIT_KEY, DEFAULT_HISTORY_LIMIT_PER_SITE));
+    return HISTORY_LIMIT_OPTIONS.includes(saved) ? saved : DEFAULT_HISTORY_LIMIT_PER_SITE;
   }
 
   function saveDisabledSites() {
@@ -926,6 +942,7 @@
     body.appendChild(createSiteEnabledSection());
     body.appendChild(createModeSection());
     body.appendChild(createSuppressSection());
+    body.appendChild(createHistoryLimitSection());
     body.appendChild(createAddSection());
     body.appendChild(createPhraseSection());
     body.appendChild(createHistorySection(sortedHistory));
@@ -1012,6 +1029,38 @@
 
     box.appendChild(text);
     box.appendChild(button);
+    section.appendChild(box);
+    return section;
+  }
+
+  function createHistoryLimitSection() {
+    const section = document.createElement('section');
+    const box = document.createElement('div');
+    box.className = 'mac-mode';
+
+    const text = document.createElement('div');
+    text.className = 'mac-mode-text';
+    text.textContent = `履歴上限: 1サイト ${historyLimitPerSite.toLocaleString('ja-JP')}件`;
+
+    const select = document.createElement('select');
+    select.setAttribute('aria-label', '1サイトあたりの履歴上限');
+    HISTORY_LIMIT_OPTIONS.forEach((limit) => {
+      const option = document.createElement('option');
+      option.value = String(limit);
+      option.textContent = `${limit.toLocaleString('ja-JP')}件`;
+      option.selected = limit === historyLimitPerSite;
+      select.appendChild(option);
+    });
+    select.addEventListener('change', () => {
+      historyLimitPerSite = Number(select.value) || DEFAULT_HISTORY_LIMIT_PER_SITE;
+      writeValue(HISTORY_LIMIT_KEY, historyLimitPerSite);
+      trimAllHistory();
+      saveHistory();
+      renderManager();
+    });
+
+    box.appendChild(text);
+    box.appendChild(select);
     section.appendChild(box);
     return section;
   }
@@ -1412,6 +1461,12 @@
     recordValue(value);
   }
 
+  function trimAllHistory() {
+    Object.keys(history).forEach((key) => {
+      history[key] = trimHistory(history[key] || {});
+    });
+  }
+
   function trimHistory(siteHistory) {
     return Object.fromEntries(
       Object.entries(siteHistory)
@@ -1419,7 +1474,7 @@
           return (Number(b.count) || 0) - (Number(a.count) || 0) ||
             (Number(b.lastUsed) || 0) - (Number(a.lastUsed) || 0);
         })
-        .slice(0, MAX_HISTORY_PER_SITE)
+        .slice(0, historyLimitPerSite)
     );
   }
 
