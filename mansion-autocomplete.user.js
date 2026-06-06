@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Mansion Name Autocomplete
-// @namespace    local.mansion-autocomplete
-// @version      1.1.0
-// @description  Add a custom autocomplete picker with site-specific usage history.
+// @name         Site Input Autocomplete
+// @namespace    local.site-input-autocomplete
+// @version      1.6.0
+// @description  Add a custom autocomplete picker with site-specific candidates and usage counts.
 // @match        http://*/*
 // @match        https://*/*
 // @all-frames   true
@@ -17,8 +17,9 @@
 (function () {
   'use strict';
 
-  const PHRASES_KEY = 'mansionAutocomplete.phrases.v2';
+  const SITE_PHRASES_KEY = 'mansionAutocomplete.sitePhrases.v1';
   const HISTORY_KEY = 'mansionAutocomplete.history.v1';
+  const PINNED_KEY = 'mansionAutocomplete.pinned.v1';
   const INPUT_MODE_KEY = 'mansionAutocomplete.inputMode.v1';
   const SUPPRESS_NATIVE_KEY = 'mansionAutocomplete.suppressNative.v1';
   const DISABLED_SITES_KEY = 'mansionAutocomplete.disabledSites.v1';
@@ -30,11 +31,10 @@
   const RECORD_DEDUPE_MS = 900;
   const ACTION_BUTTON_PATTERN = /検索|決定|確定|送信|登録|保存|次へ|反映|search|submit|ok/i;
 
-  const DEFAULT_PHRASES = [];
-
   const siteKey = location.hostname || location.host || 'unknown-site';
-  let phrases = loadPhrases();
+  let sitePhrases = loadSitePhrases();
   let history = loadHistory();
+  let pinned = loadPinned();
   let activeInput = null;
   let selectedIndex = 0;
   let matches = [];
@@ -48,6 +48,11 @@
   let lastPopupCommit = { value: '', at: 0 };
   let lastCopyCommit = { value: '', at: 0 };
   let copiedMessage = '';
+  let csvImportMessage = '';
+  let lastCsvImportEncoding = '';
+  let openPopupMenuKey = '';
+  let managerCandidateQuery = '';
+  let isManagerSearchComposing = false;
 
   const uiHost = document.createElement('div');
   uiHost.id = 'mansion-autocomplete-ui-host';
@@ -57,7 +62,7 @@
   managerButton.id = 'mansion-autocomplete-manager-button';
   managerButton.type = 'button';
   managerButton.textContent = '設定';
-  managerButton.title = 'マンション名候補の設定';
+  managerButton.title = '入力候補の設定';
 
   const manager = document.createElement('div');
   manager.id = 'mansion-autocomplete-manager';
@@ -103,8 +108,9 @@
       line-height: 1.35;
     }
     #mansion-autocomplete-popup .mac-item {
+      position: relative;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto auto;
+      grid-template-columns: minmax(0, 1fr) auto auto auto auto;
       gap: 8px;
       align-items: center;
       padding: 7px 9px;
@@ -121,7 +127,9 @@
       font-size: 12px;
       white-space: nowrap;
     }
+    #mansion-autocomplete-popup .mac-pin,
     #mansion-autocomplete-popup .mac-copy,
+    #mansion-autocomplete-popup .mac-more,
     #mansion-autocomplete-popup .mac-delete {
       display: inline-grid;
       place-items: center;
@@ -133,15 +141,51 @@
       color: #6b7280;
       cursor: pointer;
       font-size: 15px;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI Symbol", "Segoe UI", sans-serif;
       line-height: 1;
+    }
+    #mansion-autocomplete-popup .mac-pin[aria-pressed="true"] {
+      color: #f59e0b;
+      background: transparent;
+    }
+    #mansion-autocomplete-popup .mac-pin:hover {
+      background: #f3f4f6;
+      color: #f59e0b;
     }
     #mansion-autocomplete-popup .mac-copy:hover {
       background: #dbeafe;
       color: #1d4ed8;
     }
+    #mansion-autocomplete-popup .mac-more:hover,
+    #mansion-autocomplete-popup .mac-more[aria-expanded="true"] {
+      background: #f3f4f6;
+      color: #111827;
+    }
     #mansion-autocomplete-popup .mac-delete:hover {
       background: #fee2e2;
       color: #b91c1c;
+    }
+    #mansion-autocomplete-popup .mac-menu {
+      position: absolute;
+      right: 8px;
+      top: calc(100% - 2px);
+      z-index: 1;
+      display: grid;
+      gap: 4px;
+      min-width: 96px;
+      padding: 5px;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      background: #fff;
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.18);
+    }
+    #mansion-autocomplete-popup .mac-menu .mac-delete {
+      width: 100%;
+      height: auto;
+      justify-content: start;
+      padding: 6px 8px;
+      color: #b91c1c;
+      font-size: 13px;
     }
     #mansion-autocomplete-popup .mac-item[aria-selected="true"] {
       background: #1d4ed8;
@@ -150,24 +194,61 @@
     #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-meta {
       color: #dbeafe;
     }
+    #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-pin,
     #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-copy,
+    #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-more,
     #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-delete {
       color: #dbeafe;
+    }
+    #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-pin[aria-pressed="true"] {
+      background: transparent;
+      color: #fbbf24;
+    }
+    #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-pin:hover {
+      background: #f3f4f6;
+      color: #f59e0b;
     }
     #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-copy:hover {
       background: #dbeafe;
       color: #1d4ed8;
+    }
+    #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-more:hover,
+    #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-more[aria-expanded="true"] {
+      background: #f3f4f6;
+      color: #111827;
     }
     #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-delete:hover {
       background: #fee2e2;
       color: #b91c1c;
     }
     #mansion-autocomplete-popup .mac-help {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
       padding: 5px 9px 3px;
       color: #6b7280;
       font-size: 12px;
       border-top: 1px solid #e5e7eb;
       margin-top: 3px;
+    }
+    #mansion-autocomplete-popup .mac-clear-input {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border: 0;
+      border-radius: 4px;
+      padding: 3px 6px;
+      background: transparent;
+      color: #6b7280;
+      cursor: pointer;
+      font-size: 12px;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+    #mansion-autocomplete-popup .mac-clear-input:hover {
+      background: #f3f4f6;
+      color: #111827;
     }
     #mansion-autocomplete-popup .mac-toast {
       padding: 5px 9px;
@@ -184,11 +265,12 @@
       z-index: 2147483646;
       border: 1px solid #1d4ed8;
       border-radius: 999px;
-      padding: 9px 13px;
+      padding: 9px 18px;
       background: #1d4ed8;
       color: #fff;
       font-size: 13px;
       font-weight: 600;
+      letter-spacing: 0.06em;
       line-height: 1;
       box-shadow: 0 8px 24px rgba(15, 23, 42, 0.22);
       cursor: pointer;
@@ -295,6 +377,11 @@
       border-color: #fecaca;
       color: #b91c1c;
     }
+    #mansion-autocomplete-manager .mac-pin-toggle[aria-pressed="true"] {
+      border-color: #cbd5e1;
+      background: #fff;
+      color: #f59e0b;
+    }
     #mansion-autocomplete-manager .mac-list {
       display: grid;
       gap: 6px;
@@ -302,7 +389,7 @@
     }
     #mansion-autocomplete-manager .mac-list-item {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-columns: auto minmax(0, 1fr) auto auto;
       gap: 8px;
       align-items: center;
       padding: 8px 10px;
@@ -351,10 +438,9 @@
     GM_registerMenuCommand('このサイトで有効/無効を切り替え', toggleSiteEnabled);
     GM_registerMenuCommand('入力モードを切り替え', toggleInputMode);
     GM_registerMenuCommand('Chrome候補抑制を切り替え', toggleSuppressNativeAutocomplete);
-    GM_registerMenuCommand('候補リストを編集', editPhrases);
-    GM_registerMenuCommand('候補リストを初期化', resetPhrases);
-    GM_registerMenuCommand('このサイトの入力履歴を削除', clearSiteHistory);
-    GM_registerMenuCommand('すべての入力履歴を削除', clearAllHistory);
+    GM_registerMenuCommand('このサイトの候補を編集', editPhrases);
+    GM_registerMenuCommand('このサイトの候補を初期化', resetPhrases);
+    GM_registerMenuCommand('このサイトの使用回数をリセット', clearSiteHistory);
   }
 
   managerButton.addEventListener('click', openManager);
@@ -399,6 +485,7 @@
   });
 
   document.addEventListener('keydown', (event) => {
+    if (isOwnUiEvent(event)) return;
     if (isSiteDisabled()) return;
     if (event.isComposing || isComposingText || !activeInput || popup.hidden) return;
 
@@ -451,17 +538,96 @@
   window.addEventListener('resize', positionPopup);
   window.addEventListener('scroll', positionPopup, true);
 
-  function loadPhrases() {
-    const saved = readValue(PHRASES_KEY, null);
-    if (Array.isArray(saved) && saved.every((item) => typeof item === 'string')) {
-      return uniqueNonEmpty(saved);
-    }
-    return DEFAULT_PHRASES.slice();
+  function loadSitePhrases() {
+    const saved = readValue(SITE_PHRASES_KEY, {});
+    return saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
   }
 
-  function savePhrases(nextPhrases) {
-    phrases = uniqueNonEmpty(nextPhrases);
-    writeValue(PHRASES_KEY, phrases);
+  function getCurrentSitePhrases() {
+    const current = sitePhrases[siteKey];
+    return Array.isArray(current) ? uniqueNonEmpty(current) : [];
+  }
+
+  function loadPinned() {
+    const saved = readValue(PINNED_KEY, {});
+    return saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+  }
+
+  function getCurrentSitePinned() {
+    const current = pinned[siteKey];
+    return Array.isArray(current) ? uniqueNonEmpty(current) : [];
+  }
+
+  function saveCurrentSitePinned(nextPinned) {
+    const cleaned = uniqueNonEmpty(nextPinned);
+    if (cleaned.length) {
+      pinned[siteKey] = cleaned;
+    } else {
+      delete pinned[siteKey];
+    }
+    writeValue(PINNED_KEY, pinned);
+  }
+
+  function isPinned(value) {
+    const key = normalize(value);
+    return getCurrentSitePinned().some((item) => normalize(item) === key);
+  }
+
+  function togglePinned(value) {
+    const key = normalize(value);
+    const current = getCurrentSitePinned();
+    const exists = current.some((item) => normalize(item) === key);
+    if (exists) {
+      saveCurrentSitePinned(current.filter((item) => normalize(item) !== key));
+    } else {
+      addCurrentSitePhrase(value);
+      saveCurrentSitePinned(current.concat(String(value || '').trim()));
+    }
+  }
+
+  function getCurrentSiteCandidates() {
+    const siteHistory = history[siteKey] || {};
+    const candidates = new Map();
+
+    getCurrentSitePhrases().forEach((value) => {
+      candidates.set(normalize(value), {
+        value,
+        count: 0,
+        lastUsed: 0,
+        pinned: isPinned(value),
+      });
+    });
+
+    Object.entries(siteHistory).forEach(([value, stat]) => {
+      const key = normalize(value);
+      const existing = candidates.get(key);
+      candidates.set(key, {
+        value: existing ? existing.value : value,
+        count: Number(stat.count) || 0,
+        lastUsed: Number(stat.lastUsed) || 0,
+        pinned: isPinned(existing ? existing.value : value),
+      });
+    });
+
+    return Array.from(candidates.values()).sort(compareCandidate);
+  }
+
+  function saveCurrentSitePhrases(nextPhrases) {
+    const cleaned = uniqueNonEmpty(nextPhrases);
+    if (cleaned.length) {
+      sitePhrases[siteKey] = cleaned;
+    } else {
+      delete sitePhrases[siteKey];
+    }
+    writeValue(SITE_PHRASES_KEY, sitePhrases);
+  }
+
+  function addCurrentSitePhrase(value) {
+    const cleaned = String(value || '').trim();
+    if (!cleaned) return;
+    const current = getCurrentSitePhrases();
+    if (current.some((item) => normalize(item) === normalize(cleaned))) return;
+    saveCurrentSitePhrases(current.concat(cleaned));
   }
 
   function loadHistory() {
@@ -535,34 +701,49 @@
   }
 
   function editPhrases() {
+    const currentPhrases = getCurrentSitePhrases();
     const nextText = window.prompt(
-      '候補を1行に1つずつ入力してください。',
-      phrases.join('\n')
+      `${siteKey} の候補を1行に1つずつ入力してください。`,
+      currentPhrases.join('\n')
     );
     if (nextText === null) return;
-    savePhrases(nextText.split(/\r?\n/));
+    saveCurrentSitePhrases(nextText.split(/\r?\n/));
     updatePopup();
   }
 
   function resetPhrases() {
-    if (!window.confirm('候補リストを初期状態に戻しますか？')) return;
-    deleteValue(PHRASES_KEY);
-    phrases = DEFAULT_PHRASES.slice();
+    if (!confirmClearAllSiteCandidates()) return;
+    clearAllSiteCandidates();
+    managerCandidateQuery = '';
     updatePopup();
   }
 
+  function clearAllSiteCandidates() {
+    saveCurrentSitePhrases([]);
+    saveCurrentSitePinned([]);
+    delete history[siteKey];
+    saveHistory();
+  }
+
   function clearSiteHistory() {
-    if (!window.confirm(`${siteKey} の入力履歴を削除しますか？`)) return;
+    if (!confirmClearSiteHistory()) return;
+    saveCurrentSitePhrases(getCurrentSiteCandidates().map((candidate) => candidate.value));
     delete history[siteKey];
     saveHistory();
     updatePopup();
   }
 
-  function clearAllHistory() {
-    if (!window.confirm('すべてのサイトの入力履歴を削除しますか？')) return;
-    history = {};
-    deleteValue(HISTORY_KEY);
-    updatePopup();
+  function confirmClearSiteHistory() {
+    return window.confirm(`${siteKey} の候補名は残したまま、使用回数と最終使用日だけをリセットします。\nよろしいですか？`);
+  }
+
+  function confirmClearAllSiteCandidates() {
+    const count = getCurrentSiteCandidates().length;
+    if (!count) {
+      window.alert(`${siteKey} の候補はまだありません。`);
+      return false;
+    }
+    return window.confirm(`${siteKey} の候補 ${count.toLocaleString('ja-JP')}件をすべて削除します。\n使用回数とピン止め状態も削除されます。\nよろしいですか？`);
   }
 
   function toggleInputMode() {
@@ -628,6 +809,9 @@
 
     matches = buildMatches(getEntryValue(activeInput));
     selectedIndex = 0;
+    if (!matches.some((match) => normalize(match.value) === openPopupMenuKey)) {
+      openPopupMenuKey = '';
+    }
 
     if (!matches.length) {
       hidePopup();
@@ -640,58 +824,38 @@
   }
 
   function buildMatches(rawQuery) {
-    const query = normalize(rawQuery);
-    const siteHistory = history[siteKey] || {};
-    const seen = new Set();
-
-    const historyMatches = Object.entries(siteHistory)
-      .filter(([value]) => matchesQuery(value, query))
-      .map(([value, stat]) => ({
-        value,
-        source: '履歴',
-        count: Number(stat.count) || 0,
-        lastUsed: Number(stat.lastUsed) || 0,
-        rank: rankValue(value, query),
+    const query = buildSearchQuery(rawQuery);
+    return getCurrentSiteCandidates()
+      .filter((candidate) => matchesQuery(candidate.value, query))
+      .map((candidate) => ({
+        ...candidate,
+        rank: rankValue(candidate.value, query),
       }))
-      .sort(compareHistory);
-
-    const phraseMatches = phrases
-      .filter((value) => matchesQuery(value, query))
-      .map((value) => ({
-        value,
-        source: '候補',
-        count: 0,
-        lastUsed: 0,
-        rank: rankValue(value, query),
-      }))
-      .sort(comparePhrase);
-
-    return historyMatches
-      .concat(phraseMatches)
-      .filter((item) => {
-        const key = normalize(item.value);
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
+      .sort(compareMatch)
       .slice(0, MAX_RESULTS);
   }
 
   function matchesQuery(value, query) {
-    if (!query) return true;
-    return normalize(value).includes(query);
+    if (!query.compact) return true;
+    const searchable = normalizeForSearch(value);
+    return query.tokens.every((token) => searchable.includes(token));
   }
 
   function rankValue(value, query) {
-    if (!query) return 0;
-    const normalized = normalize(value);
-    if (normalized === query) return 0;
-    if (normalized.startsWith(query)) return 1;
-    return 2;
+    if (!query.compact) return 0;
+    const searchable = normalizeForSearch(value);
+    if (searchable === query.compact) return 0;
+    if (searchable.startsWith(query.compact)) return 1;
+    if (query.tokens.length > 1 && query.tokens.every((token) => searchable.startsWith(token) || searchable.includes(token))) {
+      return query.tokens[0] && searchable.startsWith(query.tokens[0]) ? 2 : 3;
+    }
+    if (query.tokens.some((token) => searchable.startsWith(token))) return 4;
+    return 5;
   }
 
-  function compareHistory(a, b) {
+  function compareMatch(a, b) {
     return (
+      Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) ||
       a.rank - b.rank ||
       b.count - a.count ||
       b.lastUsed - a.lastUsed ||
@@ -699,15 +863,43 @@
     );
   }
 
-  function comparePhrase(a, b) {
+  function compareCandidate(a, b) {
     return (
-      a.rank - b.rank ||
+      Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) ||
+      (Number(b.count) || 0) - (Number(a.count) || 0) ||
+      (Number(b.lastUsed) || 0) - (Number(a.lastUsed) || 0) ||
       a.value.localeCompare(b.value, 'ja')
     );
   }
 
   function normalize(value) {
     return String(value || '').trim().normalize('NFKC').toLowerCase();
+  }
+
+  function buildSearchQuery(value) {
+    const normalized = normalize(value);
+    const tokens = normalized
+      .split(/[\s\u3000]+/)
+      .map(normalizeForSearch)
+      .filter(Boolean);
+    const compact = normalizeForSearch(normalized);
+    return {
+      compact,
+      tokens: tokens.length ? tokens : compact ? [compact] : [],
+    };
+  }
+
+  function normalizeForSearch(value) {
+    return toKatakana(String(value || '').normalize('NFKC').toLowerCase())
+      .replace(/[ヶヵ]/g, 'ケ')
+      .replace(/\bthe\b/g, 'ザ')
+      .replace(/[\s\u3000\-‐‑‒–—―ｰー~〜・･_'’"“”.,，．/／\\|()（）［］\[\]【】<>＜＞]/g, '');
+  }
+
+  function toKatakana(value) {
+    return value.replace(/[\u3041-\u3096]/g, (char) => {
+      return String.fromCharCode(char.charCodeAt(0) + 0x60);
+    });
   }
 
   function isOwnUiEvent(event) {
@@ -762,7 +954,27 @@
 
       const meta = document.createElement('div');
       meta.className = 'mac-meta';
-      meta.textContent = match.source === '履歴' ? `履歴 ${match.count}回` : '候補';
+      meta.textContent = match.count > 0 ? `${match.count}回使用` : '未使用';
+
+      const pinButton = document.createElement('button');
+      pinButton.className = 'mac-pin';
+      pinButton.type = 'button';
+      pinButton.title = match.pinned ? `${match.value} のピン止めを解除` : `${match.value} をピン止め`;
+      pinButton.setAttribute('aria-label', pinButton.title);
+      pinButton.setAttribute('aria-pressed', String(Boolean(match.pinned)));
+      pinButton.textContent = match.pinned ? '★' : '☆';
+      const togglePinFromPopup = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        togglePinned(match.value);
+        updatePopup();
+      };
+      pinButton.addEventListener('pointerdown', togglePinFromPopup);
+      pinButton.addEventListener('mousedown', togglePinFromPopup);
+      pinButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
 
       const copyButton = document.createElement('button');
       copyButton.className = 'mac-copy';
@@ -782,28 +994,58 @@
         event.stopPropagation();
       });
 
-      const deleteButton = document.createElement('button');
-      deleteButton.className = 'mac-delete';
-      deleteButton.type = 'button';
-      deleteButton.title = `${match.value} を削除`;
-      deleteButton.setAttribute('aria-label', `${match.value} を削除`);
-      deleteButton.textContent = '🗑';
-      const deleteFromPopup = (event) => {
+      const moreButton = document.createElement('button');
+      moreButton.className = 'mac-more';
+      moreButton.type = 'button';
+      moreButton.title = 'その他の操作';
+      moreButton.setAttribute('aria-label', `${match.value} のその他の操作`);
+      moreButton.setAttribute('aria-expanded', String(openPopupMenuKey === normalize(match.value)));
+      moreButton.textContent = '…';
+      const toggleMenuFromPopup = (event) => {
         event.preventDefault();
         event.stopPropagation();
-        deleteMatch(match);
+        const key = normalize(match.value);
+        openPopupMenuKey = openPopupMenuKey === key ? '' : key;
+        renderPopup();
       };
-      deleteButton.addEventListener('pointerdown', deleteFromPopup);
-      deleteButton.addEventListener('mousedown', deleteFromPopup);
-      deleteButton.addEventListener('click', (event) => {
+      moreButton.addEventListener('pointerdown', toggleMenuFromPopup);
+      moreButton.addEventListener('mousedown', toggleMenuFromPopup);
+      moreButton.addEventListener('click', (event) => {
         event.preventDefault();
         event.stopPropagation();
       });
 
       item.appendChild(name);
+      item.appendChild(pinButton);
       item.appendChild(copyButton);
       item.appendChild(meta);
-      item.appendChild(deleteButton);
+      item.appendChild(moreButton);
+      if (openPopupMenuKey === normalize(match.value)) {
+        const menu = document.createElement('div');
+        menu.className = 'mac-menu';
+
+        const deleteButton = document.createElement('button');
+        deleteButton.className = 'mac-delete';
+        deleteButton.type = 'button';
+        deleteButton.title = `${match.value} を候補から削除`;
+        deleteButton.setAttribute('aria-label', `${match.value} を候補から削除`);
+        deleteButton.textContent = '候補を削除';
+        const deleteFromPopup = (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          openPopupMenuKey = '';
+          deleteMatch(match);
+        };
+        deleteButton.addEventListener('pointerdown', deleteFromPopup);
+        deleteButton.addEventListener('mousedown', deleteFromPopup);
+        deleteButton.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        });
+
+        menu.appendChild(deleteButton);
+        item.appendChild(menu);
+      }
       item.addEventListener('mouseenter', () => {
         selectedIndex = index;
         renderPopup();
@@ -823,18 +1065,47 @@
 
     const help = document.createElement('div');
     help.className = 'mac-help';
-    help.textContent = '↑↓で選択 / Enter・Tab・クリックで入力 / ⧉で入力+コピー';
+    const helpText = document.createElement('span');
+    helpText.textContent = 'Enter・Tab・クリックで入力 / ☆★でピン / ⧉で入力+コピー';
+
+    const clearInputButton = document.createElement('button');
+    clearInputButton.type = 'button';
+    clearInputButton.className = 'mac-clear-input';
+    clearInputButton.title = '入力欄を空にする';
+    clearInputButton.setAttribute('aria-label', '入力欄を空にする');
+    clearInputButton.textContent = '入力をクリア ×';
+    const clearInputFromPopup = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      clearActiveInput();
+    };
+    clearInputButton.addEventListener('pointerdown', clearInputFromPopup);
+    clearInputButton.addEventListener('mousedown', clearInputFromPopup);
+    clearInputButton.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+
+    help.appendChild(helpText);
+    help.appendChild(clearInputButton);
     popup.appendChild(help);
   }
 
-  function deleteMatch(match) {
-    if (match.source === '履歴') {
-      deleteHistoryValue(match.value);
-    } else {
-      savePhrases(phrases.filter((phrase) => normalize(phrase) !== normalize(match.value)));
-    }
-
+  function clearActiveInput() {
+    if (!activeInput) return;
+    setEntryValue(activeInput, '', inputMode);
     updatePopup();
+  }
+
+  function deleteMatch(match) {
+    deleteCandidateValue(match.value);
+    updatePopup();
+  }
+
+  function deleteCandidateValue(value) {
+    saveCurrentSitePhrases(getCurrentSitePhrases().filter((phrase) => normalize(phrase) !== normalize(value)));
+    saveCurrentSitePinned(getCurrentSitePinned().filter((phrase) => normalize(phrase) !== normalize(value)));
+    deleteHistoryValue(value);
   }
 
   function deleteHistoryValue(value) {
@@ -910,12 +1181,6 @@
   }
 
   function renderManager() {
-    const siteHistory = history[siteKey] || {};
-    const sortedHistory = Object.entries(siteHistory).sort(([, a], [, b]) => {
-      return (Number(b.count) || 0) - (Number(a.count) || 0) ||
-        (Number(b.lastUsed) || 0) - (Number(a.lastUsed) || 0);
-    });
-
     manager.textContent = '';
 
     const panel = document.createElement('div');
@@ -926,7 +1191,7 @@
     head.className = 'mac-manager-head';
 
     const title = document.createElement('h2');
-    title.textContent = 'マンション名候補';
+    title.textContent = '入力候補';
 
     const closeButton = document.createElement('button');
     closeButton.type = 'button';
@@ -944,8 +1209,8 @@
     body.appendChild(createSuppressSection());
     body.appendChild(createHistoryLimitSection());
     body.appendChild(createAddSection());
-    body.appendChild(createPhraseSection());
-    body.appendChild(createHistorySection(sortedHistory));
+    body.appendChild(createCsvSection());
+    body.appendChild(createCandidateSection());
 
     panel.appendChild(head);
     panel.appendChild(body);
@@ -1040,10 +1305,10 @@
 
     const text = document.createElement('div');
     text.className = 'mac-mode-text';
-    text.textContent = `履歴上限: 1サイト ${historyLimitPerSite.toLocaleString('ja-JP')}件`;
+    text.textContent = `使用回数データ上限: 1サイト ${historyLimitPerSite.toLocaleString('ja-JP')}件`;
 
     const select = document.createElement('select');
-    select.setAttribute('aria-label', '1サイトあたりの履歴上限');
+    select.setAttribute('aria-label', '1サイトあたりの使用回数データ上限');
     HISTORY_LIMIT_OPTIONS.forEach((limit) => {
       const option = document.createElement('option');
       option.value = String(limit);
@@ -1068,14 +1333,14 @@
   function createAddSection() {
     const section = document.createElement('section');
     const heading = document.createElement('h3');
-    heading.textContent = '候補を追加';
+    heading.textContent = 'このサイトの候補を追加';
 
     const row = document.createElement('div');
     row.className = 'mac-manager-row';
 
     const input = document.createElement('input');
     input.type = 'text';
-    input.placeholder = '例: パークハウス松濤';
+    input.placeholder = '例: 中野ブロードウェイ';
     input.setAttribute('aria-label', '追加する候補');
 
     const button = document.createElement('button');
@@ -1086,7 +1351,7 @@
     const add = () => {
       const value = input.value.trim();
       if (!value) return;
-      savePhrases(phrases.concat(value));
+      saveCurrentSitePhrases(getCurrentSitePhrases().concat(value));
       renderManager();
     };
 
@@ -1102,75 +1367,152 @@
     return section;
   }
 
-  function createPhraseSection() {
+  function createCsvSection() {
     const section = document.createElement('section');
     const heading = document.createElement('h3');
-    heading.textContent = '手動候補';
+    heading.textContent = 'このサイト候補CSV一括登録';
 
-    const list = document.createElement('div');
-    list.className = 'mac-list';
+    const row = document.createElement('div');
+    row.className = 'mac-manager-row';
 
-    if (!phrases.length) {
-      list.appendChild(emptyLine('手動候補はまだありません。'));
-    } else {
-      phrases.forEach((phrase) => {
-        list.appendChild(createManagerItem(phrase, '候補', () => {
-          savePhrases(phrases.filter((item) => normalize(item) !== normalize(phrase)));
-          renderManager();
-        }));
-      });
-    }
+    const importInput = document.createElement('input');
+    importInput.type = 'file';
+    importInput.accept = '.csv,text/csv,text/plain';
+    importInput.hidden = true;
+    importInput.addEventListener('change', () => {
+      const file = importInput.files && importInput.files[0];
+      if (!file) return;
+      importPhrasesFromCsv(file);
+      importInput.value = '';
+    });
 
+    const importButton = document.createElement('button');
+    importButton.type = 'button';
+    importButton.className = 'mac-primary';
+    importButton.textContent = 'CSVインポート';
+    importButton.addEventListener('click', () => importInput.click());
+
+    const exportButton = document.createElement('button');
+    exportButton.type = 'button';
+    exportButton.textContent = 'このサイトの候補をCSVエクスポート';
+    exportButton.addEventListener('click', exportPhrasesToCsv);
+
+    const help = document.createElement('div');
+    help.className = 'mac-empty';
+    help.textContent = 'name列または1列目を、このサイトの候補として追加します。セル内改行がある行はスキップします。エクスポートには使用回数とピン止め状態も含めます。';
+
+    row.appendChild(importButton);
+    row.appendChild(exportButton);
     section.appendChild(heading);
-    section.appendChild(list);
+    section.appendChild(row);
+    section.appendChild(help);
+    if (csvImportMessage) {
+      const result = document.createElement('div');
+      result.className = 'mac-empty';
+      result.textContent = csvImportMessage;
+      section.appendChild(result);
+    }
+    section.appendChild(importInput);
     return section;
   }
 
-  function createHistorySection(sortedHistory) {
+  function createCandidateSection() {
     const section = document.createElement('section');
     const heading = document.createElement('h3');
-    heading.textContent = `このサイトの履歴: ${siteKey}`;
+    heading.textContent = `このサイトの候補: ${siteKey}`;
 
     const actions = document.createElement('div');
     actions.className = 'mac-manager-row';
 
-    const clearSiteButton = document.createElement('button');
-    clearSiteButton.type = 'button';
-    clearSiteButton.className = 'mac-danger';
-    clearSiteButton.textContent = 'このサイトの履歴を削除';
-    clearSiteButton.addEventListener('click', clearSiteHistoryFromManager);
+    const clearUsageButton = document.createElement('button');
+    clearUsageButton.type = 'button';
+    clearUsageButton.className = 'mac-danger';
+    clearUsageButton.textContent = '使用回数をリセット';
+    clearUsageButton.addEventListener('click', clearSiteHistoryFromManager);
 
     const clearAllButton = document.createElement('button');
     clearAllButton.type = 'button';
     clearAllButton.className = 'mac-danger';
-    clearAllButton.textContent = '全履歴を削除';
-    clearAllButton.addEventListener('click', clearAllHistoryFromManager);
+    clearAllButton.textContent = 'すべて削除';
+    clearAllButton.addEventListener('click', clearAllSiteCandidatesFromManager);
 
-    actions.appendChild(clearSiteButton);
+    actions.appendChild(clearUsageButton);
     actions.appendChild(clearAllButton);
+
+    const note = document.createElement('div');
+    note.className = 'mac-empty';
+    note.textContent = '検索・決定した名前も自動でこの候補に追加されます。使用回数は候補の並び順に使います。';
+
+    const searchRow = document.createElement('div');
+    searchRow.className = 'mac-manager-row';
+
+    const searchInput = document.createElement('input');
+    searchInput.type = 'search';
+    searchInput.placeholder = '候補を検索';
+    searchInput.value = managerCandidateQuery;
+    searchInput.setAttribute('aria-label', '候補を検索');
+    searchInput.addEventListener('compositionstart', () => {
+      isManagerSearchComposing = true;
+    });
+    searchInput.addEventListener('compositionend', () => {
+      isManagerSearchComposing = false;
+      managerCandidateQuery = searchInput.value;
+      renderManagerPreservingScroll({ focusCandidateSearch: true });
+    });
+    searchInput.addEventListener('input', (event) => {
+      managerCandidateQuery = searchInput.value;
+      if (isManagerSearchComposing || event.isComposing) return;
+      renderManagerPreservingScroll({ focusCandidateSearch: true });
+    });
+
+    searchRow.appendChild(searchInput);
 
     const list = document.createElement('div');
     list.className = 'mac-list';
+    const candidates = getCurrentSiteCandidates();
+    const query = buildSearchQuery(managerCandidateQuery);
+    const filteredCandidates = query.compact
+      ? candidates.filter((candidate) => matchesQuery(candidate.value, query)).map((candidate) => ({
+        ...candidate,
+        rank: rankValue(candidate.value, query),
+      })).sort(compareMatch)
+      : candidates;
 
-    if (!sortedHistory.length) {
-      list.appendChild(emptyLine('このサイトの履歴はまだありません。'));
+    const countLine = document.createElement('div');
+    countLine.className = 'mac-empty';
+    countLine.textContent = query.compact
+      ? `表示中 ${filteredCandidates.length.toLocaleString('ja-JP')}件 / 全 ${candidates.length.toLocaleString('ja-JP')}件`
+      : `全 ${candidates.length.toLocaleString('ja-JP')}件`;
+
+    if (!candidates.length) {
+      list.appendChild(emptyLine('このサイトの候補はまだありません。'));
+    } else if (!filteredCandidates.length) {
+      list.appendChild(emptyLine('一致する候補はありません。'));
     } else {
-      sortedHistory.forEach(([value, stat]) => {
-        const count = Number(stat.count) || 0;
-        list.appendChild(createManagerItem(value, `履歴 ${count}回`, () => {
-          deleteHistoryValue(value);
-          renderManager();
+      filteredCandidates.forEach((candidate) => {
+        list.appendChild(createManagerItem(candidate.value, candidate.count > 0 ? `${candidate.count}回使用` : '未使用', () => {
+          deleteCandidateValue(candidate.value);
+          renderManagerPreservingScroll();
+        }, {
+          pinned: candidate.pinned,
+          onTogglePin: () => {
+            togglePinned(candidate.value);
+            renderManagerPreservingScroll();
+          },
         }));
       });
     }
 
     section.appendChild(heading);
     section.appendChild(actions);
+    section.appendChild(note);
+    section.appendChild(searchRow);
+    section.appendChild(countLine);
     section.appendChild(list);
     return section;
   }
 
-  function createManagerItem(value, metaText, onDelete) {
+  function createManagerItem(value, metaText, onDelete, options = {}) {
     const item = document.createElement('div');
     item.className = 'mac-list-item';
 
@@ -1182,16 +1524,302 @@
     meta.className = 'mac-list-meta';
     meta.textContent = metaText;
 
+    const pinButton = document.createElement('button');
+    pinButton.type = 'button';
+    pinButton.className = 'mac-pin-toggle';
+    pinButton.textContent = options.pinned ? '★' : '☆';
+    pinButton.title = options.pinned ? `${value} のピン止めを解除` : `${value} をピン止め`;
+    pinButton.setAttribute('aria-label', pinButton.title);
+    pinButton.setAttribute('aria-pressed', String(Boolean(options.pinned)));
+    pinButton.addEventListener('click', options.onTogglePin || (() => {}));
+
     const deleteButton = document.createElement('button');
     deleteButton.type = 'button';
     deleteButton.className = 'mac-danger';
     deleteButton.textContent = 'ゴミ箱';
     deleteButton.addEventListener('click', onDelete);
 
+    item.appendChild(pinButton);
     item.appendChild(name);
     item.appendChild(meta);
     item.appendChild(deleteButton);
     return item;
+  }
+
+  async function importPhrasesFromCsv(file) {
+    try {
+      const text = await readCsvFileText(file);
+      const result = extractPhrasesFromCsv(text);
+      const imported = result.entries.map((entry) => entry.value);
+      if (!imported.length) {
+        csvImportMessage = formatCsvImportMessage(0, 0, result.skippedRows);
+        window.alert('CSVから候補を読み取れませんでした。');
+        renderManager();
+        return;
+      }
+
+      const before = getCurrentSitePhrases().length;
+      saveCurrentSitePhrases(getCurrentSitePhrases().concat(imported));
+      importUsageStats(result.entries);
+      importPinnedState(result.entries);
+      const added = getCurrentSitePhrases().length - before;
+      csvImportMessage = formatCsvImportMessage(result.readCount, added, result.skippedRows);
+      window.alert(`${imported.length}件読み取り、${added}件追加しました。`);
+      renderManager();
+    } catch (error) {
+      window.alert(`CSVインポートに失敗しました: ${error && error.message ? error.message : error}`);
+    }
+  }
+
+  async function readCsvFileText(file) {
+    const buffer = await file.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+
+    if (hasUtf8Bom(bytes)) {
+      lastCsvImportEncoding = 'UTF-8 BOM';
+      return new TextDecoder('utf-8').decode(bytes.subarray(3));
+    }
+    if (hasUtf16LeBom(bytes)) {
+      lastCsvImportEncoding = 'UTF-16 LE';
+      return new TextDecoder('utf-16le').decode(bytes.subarray(2));
+    }
+    if (hasUtf16BeBom(bytes)) {
+      lastCsvImportEncoding = 'UTF-16 BE';
+      return new TextDecoder('utf-16be').decode(bytes.subarray(2));
+    }
+
+    const utf8 = new TextDecoder('utf-8').decode(bytes);
+    const shiftJis = decodeShiftJis(bytes);
+    return chooseCsvText(utf8, shiftJis);
+  }
+
+  function hasUtf8Bom(bytes) {
+    return bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF;
+  }
+
+  function hasUtf16LeBom(bytes) {
+    return bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE;
+  }
+
+  function hasUtf16BeBom(bytes) {
+    return bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF;
+  }
+
+  function decodeShiftJis(bytes) {
+    try {
+      return new TextDecoder('shift_jis').decode(bytes);
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function chooseCsvText(utf8, shiftJis) {
+    if (!shiftJis) {
+      lastCsvImportEncoding = 'UTF-8';
+      return utf8;
+    }
+
+    const utf8ReplacementCount = countReplacementChars(utf8);
+    const shiftJisReplacementCount = countReplacementChars(shiftJis);
+    if (utf8ReplacementCount > 0 && shiftJisReplacementCount === 0) {
+      lastCsvImportEncoding = 'Shift-JIS/CP932';
+      return shiftJis;
+    }
+
+    const utf8Score = scoreDecodedText(utf8);
+    const shiftJisScore = scoreDecodedText(shiftJis);
+    if (shiftJisScore < utf8Score) {
+      lastCsvImportEncoding = 'Shift-JIS/CP932';
+      return shiftJis;
+    }
+
+    lastCsvImportEncoding = 'UTF-8';
+    return utf8;
+  }
+
+  function countReplacementChars(text) {
+    return (text.match(/\uFFFD/g) || []).length;
+  }
+
+  function scoreDecodedText(text) {
+    const replacementCount = countReplacementChars(text);
+    const mojibakeCount = (text.match(/[縺繧譁蜷鬆莨髱逕荳]/g) || []).length;
+    const japaneseCount = (text.match(/[\u3040-\u30ff\u3400-\u9fff]/g) || []).length;
+    return replacementCount * 100 + mojibakeCount * 8 - japaneseCount;
+  }
+
+  function extractPhrasesFromCsv(text) {
+    const rows = parseCsv(String(text || '').replace(/^\uFEFF/, ''));
+    if (!rows.length) return { entries: [], readCount: 0, skippedRows: [] };
+
+    const firstRow = rows[0].map((cell) => normalize(cell));
+    const nameIndex = firstRow.indexOf('name');
+    const countIndex = firstRow.indexOf('count');
+    const lastUsedIndex = firstRow.indexOf('lastused');
+    const pinnedIndex = firstRow.indexOf('pinned');
+    const startIndex = nameIndex >= 0 ? 1 : 0;
+    const targetIndex = nameIndex >= 0 ? nameIndex : 0;
+    const entries = [];
+    const skippedRows = [];
+    const seen = new Set();
+
+    rows.slice(startIndex).forEach((row, index) => {
+      const rowNumber = startIndex + index + 1;
+      const rawValue = row[targetIndex] || '';
+      const value = rawValue.trim();
+      if (!value) return;
+      if (/[\r\n]/.test(rawValue)) {
+        skippedRows.push({ rowNumber, reason: 'セル内改行', value: value.replace(/\s+/g, ' ') });
+        return;
+      }
+      if (/\uFFFD/.test(value)) {
+        skippedRows.push({ rowNumber, reason: '文字化けの可能性', value });
+        return;
+      }
+      const key = normalize(value);
+      if (seen.has(key)) return;
+      seen.add(key);
+      entries.push({
+        value,
+        count: countIndex >= 0 ? parseCsvCount(row[countIndex]) : 0,
+        lastUsed: lastUsedIndex >= 0 ? parseCsvDate(row[lastUsedIndex]) : 0,
+        pinned: pinnedIndex >= 0 ? parseCsvBoolean(row[pinnedIndex]) : false,
+      });
+    });
+
+    return {
+      entries,
+      readCount: entries.length,
+      skippedRows,
+    };
+  }
+
+  function parseCsvCount(value) {
+    const count = Number(String(value || '').replace(/,/g, '').trim());
+    return Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
+  }
+
+  function parseCsvDate(value) {
+    const text = String(value || '').trim();
+    if (!text) return 0;
+    const time = Date.parse(text);
+    return Number.isFinite(time) ? time : 0;
+  }
+
+  function parseCsvBoolean(value) {
+    const text = normalize(value);
+    return ['1', 'true', 'yes', 'y', 'on', 'pinned', 'pin', 'ピン', '固定'].includes(text);
+  }
+
+  function importUsageStats(entries) {
+    const stats = entries.filter((entry) => entry.count > 0 || entry.lastUsed > 0);
+    if (!stats.length) return;
+
+    const siteHistory = history[siteKey] || {};
+    stats.forEach((entry) => {
+      const existingKey = Object.keys(siteHistory).find((key) => normalize(key) === normalize(entry.value));
+      const key = existingKey || entry.value;
+      const current = siteHistory[key] || { count: 0, lastUsed: 0 };
+      siteHistory[key] = {
+        count: Math.max(Number(current.count) || 0, Number(entry.count) || 0),
+        lastUsed: Math.max(Number(current.lastUsed) || 0, Number(entry.lastUsed) || 0),
+      };
+    });
+
+    history[siteKey] = trimHistory(siteHistory);
+    saveHistory();
+  }
+
+  function importPinnedState(entries) {
+    const pinnedEntries = entries.filter((entry) => entry.pinned).map((entry) => entry.value);
+    if (!pinnedEntries.length) return;
+    saveCurrentSitePinned(getCurrentSitePinned().concat(pinnedEntries));
+  }
+
+  function formatCsvImportMessage(readCount, added, skippedRows) {
+    const encoding = lastCsvImportEncoding ? ` / 文字コード: ${lastCsvImportEncoding}` : '';
+    const parts = [`CSV結果: 読み取り ${readCount}件 / 追加 ${added}件${encoding}`];
+    if (skippedRows.length) {
+      const rows = skippedRows.slice(0, 8).map((item) => `${item.rowNumber}行目(${item.reason})`);
+      const suffix = skippedRows.length > rows.length ? ` ほか${skippedRows.length - rows.length}件` : '';
+      parts.push(`スキップ: ${rows.join('、')}${suffix}`);
+    }
+    return parts.join('。');
+  }
+
+  function parseCsv(text) {
+    const rows = [];
+    let row = [];
+    let cell = '';
+    let inQuotes = false;
+
+    for (let index = 0; index < text.length; index += 1) {
+      const char = text[index];
+      const next = text[index + 1];
+
+      if (inQuotes) {
+        if (char === '"' && next === '"') {
+          cell += '"';
+          index += 1;
+        } else if (char === '"') {
+          inQuotes = false;
+        } else {
+          cell += char;
+        }
+      } else if (char === '"') {
+        inQuotes = true;
+      } else if (char === ',') {
+        row.push(cell);
+        cell = '';
+      } else if (char === '\n') {
+        row.push(cell);
+        rows.push(row);
+        row = [];
+        cell = '';
+      } else if (char !== '\r') {
+        cell += char;
+      }
+    }
+
+    row.push(cell);
+    rows.push(row);
+    return rows.filter((item) => item.some((cellValue) => cellValue.trim()));
+  }
+
+  function exportPhrasesToCsv() {
+    const rows = [
+      ['name', 'count', 'lastUsed', 'pinned'],
+      ...getCurrentSiteCandidates().map((candidate) => [
+        candidate.value,
+        String(candidate.count || 0),
+        candidate.lastUsed ? new Date(candidate.lastUsed).toISOString() : '',
+        candidate.pinned ? '1' : '',
+      ]),
+    ];
+    const csv = rows.map((row) => row.map(escapeCsvCell).join(',')).join('\r\n') + '\r\n';
+    const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    const date = new Date().toISOString().slice(0, 10).replaceAll('-', '');
+
+    anchor.href = url;
+    anchor.download = `mansion-autocomplete-${sanitizeFilename(siteKey)}-candidates-${date}.csv`;
+    document.documentElement.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function escapeCsvCell(value) {
+    const text = String(value || '');
+    if (/[",\r\n]/.test(text)) {
+      return `"${text.replaceAll('"', '""')}"`;
+    }
+    return text;
+  }
+
+  function sanitizeFilename(value) {
+    return String(value || 'site').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80);
   }
 
   function emptyLine(text) {
@@ -1202,15 +1830,37 @@
   }
 
   function clearSiteHistoryFromManager() {
+    if (!confirmClearSiteHistory()) return;
+    saveCurrentSitePhrases(getCurrentSiteCandidates().map((candidate) => candidate.value));
     delete history[siteKey];
     saveHistory();
     renderManager();
   }
 
-  function clearAllHistoryFromManager() {
-    history = {};
-    deleteValue(HISTORY_KEY);
+  function clearAllSiteCandidatesFromManager() {
+    if (!confirmClearAllSiteCandidates()) return;
+    clearAllSiteCandidates();
+    managerCandidateQuery = '';
     renderManager();
+    updatePopup();
+  }
+
+  function renderManagerPreservingScroll(options = {}) {
+    const currentPanel = manager.querySelector('.mac-manager-panel');
+    const scrollTop = currentPanel ? currentPanel.scrollTop : 0;
+    renderManager();
+    const nextPanel = manager.querySelector('.mac-manager-panel');
+    if (nextPanel) {
+      nextPanel.scrollTop = Math.min(scrollTop, nextPanel.scrollHeight);
+    }
+    if (options.focusCandidateSearch) {
+      const searchInput = manager.querySelector('input[aria-label="候補を検索"]');
+      if (searchInput) {
+        searchInput.focus();
+        const end = searchInput.value.length;
+        searchInput.setSelectionRange(end, end);
+      }
+    }
   }
 
   function positionPopup() {
@@ -1255,7 +1905,7 @@
   }
 
   function commitFromPopup(event, value) {
-    if (event.target.closest && event.target.closest('.mac-delete, .mac-copy')) return;
+    if (event.target.closest && event.target.closest('.mac-delete, .mac-copy, .mac-pin, .mac-more, .mac-menu')) return;
 
     event.preventDefault();
     event.stopPropagation();
@@ -1370,6 +2020,8 @@
     const value = String(rawValue || '').trim();
     if (value.length < MIN_RECORD_LENGTH) return;
 
+    addCurrentSitePhrase(value);
+
     const normalized = normalize(value);
     const siteHistory = history[siteKey] || {};
     const existingKey = Object.keys(siteHistory).find((key) => normalize(key) === normalized);
@@ -1482,5 +2134,6 @@
     popup.hidden = true;
     matches = [];
     selectedIndex = 0;
+    openPopupMenuKey = '';
   }
 })();
