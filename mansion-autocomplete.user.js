@@ -97,7 +97,7 @@
       position: fixed;
       z-index: 2147483647;
       min-width: 240px;
-      max-width: min(560px, calc(100vw - 24px));
+      max-width: calc(100vw - 16px);
       max-height: 280px;
       overflow-y: auto;
       box-sizing: border-box;
@@ -121,9 +121,10 @@
       cursor: pointer;
     }
     #mansion-autocomplete-popup .mac-name {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      min-width: 0;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     #mansion-autocomplete-popup .mac-meta {
       color: #6b7280;
@@ -1890,9 +1891,10 @@
     const rect = activeInput.getBoundingClientRect();
     const viewportGap = 8;
     const belowTop = rect.bottom + 4;
-    const width = Math.max(rect.width, 240);
+    const maxWidth = window.innerWidth - viewportGap * 2;
+    const width = Math.min(maxWidth, Math.max(rect.width, estimatePopupWidth()));
 
-    popup.style.width = `${Math.min(width, window.innerWidth - viewportGap * 2)}px`;
+    popup.style.width = `${width}px`;
     popup.style.left = `${Math.min(
       Math.max(rect.left, viewportGap),
       window.innerWidth - popup.offsetWidth - viewportGap
@@ -1904,6 +1906,13 @@
     popup.style.top = fitsBelow
       ? `${belowTop}px`
       : `${Math.max(viewportGap, aboveTop)}px`;
+  }
+
+  function estimatePopupWidth() {
+    const longest = matches.reduce((max, match) => Math.max(max, String(match.value || '').length), 0);
+    const actionWidth = 150;
+    const estimatedTextWidth = Math.min(720, longest * 15);
+    return Math.max(320, estimatedTextWidth + actionWidth);
   }
 
   // --- 入力欄への反映 -------------------------------------------------------
