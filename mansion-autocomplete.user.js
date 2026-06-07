@@ -1,8 +1,11 @@
 // ==UserScript==
 // @name         Site Input Autocomplete
 // @namespace    local.site-input-autocomplete
-// @version      1.6.0
+// @version      1.7.2
 // @description  Add a custom autocomplete picker with site-specific candidates and usage counts.
+// @homepageURL   https://github.com/poison-cookie/mansion-autocomplete
+// @updateURL     https://raw.githubusercontent.com/poison-cookie/mansion-autocomplete/main/mansion-autocomplete.user.js
+// @downloadURL   https://raw.githubusercontent.com/poison-cookie/mansion-autocomplete/main/mansion-autocomplete.user.js
 // @match        http://*/*
 // @match        https://*/*
 // @all-frames   true
@@ -10,6 +13,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
+// @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
 // @run-at       document-idle
 // ==/UserScript==
@@ -25,6 +29,18 @@
   const SUPPRESS_NATIVE_KEY = 'mansionAutocomplete.suppressNative.v1';
   const DISABLED_SITES_KEY = 'mansionAutocomplete.disabledSites.v1';
   const HISTORY_LIMIT_KEY = 'mansionAutocomplete.historyLimit.v1';
+  const SCRIPT_VERSION = '1.7.2';
+  const MIGRATION_SCHEMA = 'site-input-autocomplete';
+  const MIGRATION_VERSION = 1;
+  const SYNC_STORAGE_KEYS = [
+    SITE_PHRASES_KEY,
+    HISTORY_KEY,
+    PINNED_KEY,
+    INPUT_MODE_KEY,
+    SUPPRESS_NATIVE_KEY,
+    DISABLED_SITES_KEY,
+    HISTORY_LIMIT_KEY,
+  ];
   const MAX_RESULTS = 12;
   const DEFAULT_HISTORY_LIMIT_PER_SITE = 5000;
   const HISTORY_LIMIT_OPTIONS = [500, 1000, 3000, 5000, 10000];
@@ -55,6 +71,16 @@
   let openPopupMenuKey = '';
   let managerCandidateQuery = '';
   let isManagerSearchComposing = false;
+  let managerView = 'settings';
+  let migrationSelectedSites = [];
+  let migrationSiteQuery = '';
+  let migrationIncludePinned = true;
+  let migrationIncludeHistory = false;
+  let migrationIncludeSettings = true;
+  let migrationImportIncludePinned = true;
+  let migrationImportIncludeHistory = false;
+  let migrationImportIncludeSettings = true;
+  let migrationMessage = '';
 
   const uiHost = document.createElement('div');
   uiHost.id = 'mansion-autocomplete-ui-host';
@@ -342,6 +368,8 @@
     #mansion-autocomplete-manager .mac-manager-row {
       display: flex;
       gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
     }
     #mansion-autocomplete-manager input,
     #mansion-autocomplete-manager select {
@@ -363,7 +391,7 @@
     #mansion-autocomplete-manager button {
       border: 1px solid #cbd5e1;
       border-radius: 6px;
-      padding: 8px 11px;
+      padding: 9px 13px;
       background: #fff;
       color: #111827;
       font-size: 13px;
@@ -371,6 +399,10 @@
       line-height: 1.2;
       cursor: pointer;
       white-space: nowrap;
+    }
+    #mansion-autocomplete-manager button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
     }
     #mansion-autocomplete-manager .mac-primary {
       border-color: #1d4ed8;
@@ -411,6 +443,80 @@
       color: #64748b;
       font-size: 12px;
     }
+    #mansion-autocomplete-manager .mac-check-options,
+    #mansion-autocomplete-manager .mac-check-list {
+      display: grid;
+      gap: 8px;
+    }
+    #mansion-autocomplete-manager .mac-migration-body {
+      gap: 22px;
+    }
+    #mansion-autocomplete-manager .mac-migration-section {
+      display: grid;
+      gap: 12px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid #e5e7eb;
+    }
+    #mansion-autocomplete-manager .mac-migration-section:last-child {
+      padding-bottom: 0;
+      border-bottom: 0;
+    }
+    #mansion-autocomplete-manager .mac-migration-section h3 {
+      margin-bottom: 0;
+    }
+    #mansion-autocomplete-manager .mac-migration-actions {
+      gap: 10px;
+    }
+    #mansion-autocomplete-manager .mac-migration-search input {
+      flex-basis: 260px;
+    }
+    #mansion-autocomplete-manager .mac-check-options {
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+    }
+    #mansion-autocomplete-manager .mac-check-list {
+      max-height: 280px;
+      overflow: auto;
+      padding: 10px;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      background: #f8fafc;
+    }
+    #mansion-autocomplete-manager .mac-check-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      min-width: 0;
+      color: #334155;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+    #mansion-autocomplete-manager .mac-check-options .mac-check-item,
+    #mansion-autocomplete-manager .mac-check-list .mac-check-item {
+      padding: 9px 10px;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      background: #fff;
+    }
+    #mansion-autocomplete-manager .mac-check-list .mac-check-item + .mac-check-item {
+      margin-top: 2px;
+    }
+    #mansion-autocomplete-manager .mac-check-item input[type="checkbox"] {
+      flex: 0 0 auto;
+      width: auto;
+      margin-top: 2px;
+    }
+    #mansion-autocomplete-manager .mac-check-text {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+    #mansion-autocomplete-manager .mac-status {
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: #ecfdf5;
+      color: #166534;
+      font-size: 12px;
+    }
     @media (max-width: 560px) {
       #mansion-autocomplete-manager {
         padding: 8px;
@@ -440,6 +546,7 @@
   if (typeof GM_registerMenuCommand === 'function') {
     // Tampermonkey の拡張機能メニューからも主要操作を実行できるようにする。
     GM_registerMenuCommand('設定画面を開く', openManager);
+    GM_registerMenuCommand('移行画面を開く', openMigration);
     GM_registerMenuCommand('このサイトで有効/無効を切り替え', toggleSiteEnabled);
     GM_registerMenuCommand('入力モードを切り替え', toggleInputMode);
     GM_registerMenuCommand('Chrome候補抑制を切り替え', toggleSuppressNativeAutocomplete);
@@ -449,6 +556,7 @@
   }
 
   managerButton.addEventListener('click', openManager);
+  setupStorageSync();
 
   // 入力欄にフォーカスしたら候補ポップアップを表示する。
   document.addEventListener('focusin', (event) => {
@@ -570,14 +678,82 @@
     return Array.isArray(current) ? uniqueNonEmpty(current) : [];
   }
 
-  function saveCurrentSitePinned(nextPinned) {
+  function writeCurrentSitePhrases(nextPhrases, store) {
+    const nextStore = store && typeof store === 'object' && !Array.isArray(store) ? store : {};
+    const cleaned = uniqueNonEmpty(nextPhrases);
+    if (cleaned.length) {
+      nextStore[siteKey] = cleaned;
+    } else {
+      delete nextStore[siteKey];
+    }
+    sitePhrases = nextStore;
+    writeValue(SITE_PHRASES_KEY, sitePhrases);
+    return cleaned;
+  }
+
+  function saveCurrentSitePhrases(nextPhrases) {
+    return writeCurrentSitePhrases(nextPhrases, loadSitePhrases());
+  }
+
+  function mergeCurrentSitePhrases(nextPhrases) {
+    const additions = uniqueNonEmpty(nextPhrases);
+    const latest = loadSitePhrases();
+    const current = Array.isArray(latest[siteKey]) ? uniqueNonEmpty(latest[siteKey]) : [];
+    if (!additions.length) {
+      sitePhrases = latest;
+      return current;
+    }
+    return writeCurrentSitePhrases(current.concat(additions), latest);
+  }
+
+  function removeCurrentSitePhrases(values) {
+    const removeKeys = new Set(uniqueNonEmpty(values).map((item) => normalize(item)));
+    const latest = loadSitePhrases();
+    const current = Array.isArray(latest[siteKey]) ? uniqueNonEmpty(latest[siteKey]) : [];
+    if (!removeKeys.size) {
+      sitePhrases = latest;
+      return current;
+    }
+    return writeCurrentSitePhrases(current.filter((phrase) => !removeKeys.has(normalize(phrase))), latest);
+  }
+
+  function writeCurrentSitePinned(nextPinned, store) {
+    const nextStore = store && typeof store === 'object' && !Array.isArray(store) ? store : {};
     const cleaned = uniqueNonEmpty(nextPinned);
     if (cleaned.length) {
-      pinned[siteKey] = cleaned;
+      nextStore[siteKey] = cleaned;
     } else {
-      delete pinned[siteKey];
+      delete nextStore[siteKey];
     }
+    pinned = nextStore;
     writeValue(PINNED_KEY, pinned);
+    return cleaned;
+  }
+
+  function saveCurrentSitePinned(nextPinned) {
+    return writeCurrentSitePinned(nextPinned, loadPinned());
+  }
+
+  function mergeCurrentSitePinned(nextPinned) {
+    const additions = uniqueNonEmpty(nextPinned);
+    const latest = loadPinned();
+    const current = Array.isArray(latest[siteKey]) ? uniqueNonEmpty(latest[siteKey]) : [];
+    if (!additions.length) {
+      pinned = latest;
+      return current;
+    }
+    return writeCurrentSitePinned(current.concat(additions), latest);
+  }
+
+  function removeCurrentSitePinned(values) {
+    const removeKeys = new Set(uniqueNonEmpty(values).map((item) => normalize(item)));
+    const latest = loadPinned();
+    const current = Array.isArray(latest[siteKey]) ? uniqueNonEmpty(latest[siteKey]) : [];
+    if (!removeKeys.size) {
+      pinned = latest;
+      return current;
+    }
+    return writeCurrentSitePinned(current.filter((phrase) => !removeKeys.has(normalize(phrase))), latest);
   }
 
   function isPinned(value) {
@@ -586,19 +762,20 @@
   }
 
   function togglePinned(value) {
+    pinned = loadPinned();
     const key = normalize(value);
     const current = getCurrentSitePinned();
     const exists = current.some((item) => normalize(item) === key);
     if (exists) {
-      saveCurrentSitePinned(current.filter((item) => normalize(item) !== key));
+      removeCurrentSitePinned([value]);
     } else {
       addCurrentSitePhrase(value);
-      saveCurrentSitePinned(current.concat(String(value || '').trim()));
+      mergeCurrentSitePinned([value]);
     }
   }
 
   function getCurrentSiteCandidates() {
-    const siteHistory = history[siteKey] || {};
+    const siteHistory = getHistoryForSite(history);
     const candidates = new Map();
 
     getCurrentSitePhrases().forEach((value) => {
@@ -624,22 +801,10 @@
     return Array.from(candidates.values()).sort(compareCandidate);
   }
 
-  function saveCurrentSitePhrases(nextPhrases) {
-    const cleaned = uniqueNonEmpty(nextPhrases);
-    if (cleaned.length) {
-      sitePhrases[siteKey] = cleaned;
-    } else {
-      delete sitePhrases[siteKey];
-    }
-    writeValue(SITE_PHRASES_KEY, sitePhrases);
-  }
-
   function addCurrentSitePhrase(value) {
     const cleaned = String(value || '').trim();
     if (!cleaned) return;
-    const current = getCurrentSitePhrases();
-    if (current.some((item) => normalize(item) === normalize(cleaned))) return;
-    saveCurrentSitePhrases(current.concat(cleaned));
+    mergeCurrentSitePhrases([cleaned]);
   }
 
   function loadHistory() {
@@ -678,6 +843,36 @@
     writeValue(HISTORY_KEY, history);
   }
 
+  function getHistoryForSite(store) {
+    const current = store && store[siteKey];
+    return current && typeof current === 'object' && !Array.isArray(current) ? current : {};
+  }
+
+  function writeHistoryStore(nextHistory) {
+    history = nextHistory && typeof nextHistory === 'object' && !Array.isArray(nextHistory) ? nextHistory : {};
+    writeValue(HISTORY_KEY, history);
+    return history;
+  }
+
+  function updateCurrentSiteHistory(mutator) {
+    const latest = loadHistory();
+    const siteHistory = { ...getHistoryForSite(latest) };
+    const nextSiteHistory = mutator(siteHistory) || siteHistory;
+    if (nextSiteHistory && Object.keys(nextSiteHistory).length) {
+      latest[siteKey] = trimHistory(nextSiteHistory);
+    } else {
+      delete latest[siteKey];
+    }
+    writeHistoryStore(latest);
+    return getHistoryForSite(history);
+  }
+
+  function clearCurrentSiteHistory() {
+    const latest = loadHistory();
+    delete latest[siteKey];
+    writeHistoryStore(latest);
+  }
+
   function readValue(key, fallback) {
     try {
       if (typeof GM_getValue === 'function') return GM_getValue(key, fallback);
@@ -713,7 +908,60 @@
   }
 
   // --- Tampermonkeyメニューから呼ぶ操作 ------------------------------------
+  function setupStorageSync() {
+    if (typeof GM_addValueChangeListener === 'function') {
+      SYNC_STORAGE_KEYS.forEach((key) => {
+        GM_addValueChangeListener(key, (_name, _oldValue, _newValue, remote) => {
+          if (!remote) return;
+          syncStoredData();
+          refreshUiAfterStorageSync();
+        });
+      });
+    }
+
+    window.addEventListener('storage', (event) => {
+      if (event.key !== null && !SYNC_STORAGE_KEYS.includes(event.key)) return;
+      syncStoredData();
+      refreshUiAfterStorageSync();
+    });
+
+    window.addEventListener('focus', () => {
+      syncStoredData();
+      refreshUiAfterStorageSync();
+    });
+  }
+
+  function syncStoredData() {
+    sitePhrases = loadSitePhrases();
+    history = loadHistory();
+    pinned = loadPinned();
+    inputMode = loadInputMode();
+    suppressNativeAutocomplete = loadSuppressNativeAutocomplete();
+    disabledSites = loadDisabledSites();
+    historyLimitPerSite = loadHistoryLimitPerSite();
+  }
+
+  function refreshUiAfterStorageSync() {
+    if (isSiteDisabled()) {
+      hidePopup();
+      if (activeInput) restoreEntryAttributes(activeInput);
+    } else if (activeInput && isTextEntry(activeInput)) {
+      applyNativeAutocompleteSuppression(activeInput);
+      updatePopup();
+    }
+
+    const focusedInManager = uiRoot.activeElement && manager.contains(uiRoot.activeElement);
+    if (!manager.hidden && !focusedInManager && !isManagerSearchComposing) {
+      if (managerView === 'migration') {
+        renderMigration();
+      } else {
+        renderManagerPreservingScroll();
+      }
+    }
+  }
+
   function editPhrases() {
+    syncStoredData();
     const currentPhrases = getCurrentSitePhrases();
     const nextText = window.prompt(
       `${siteKey} の候補を1行に1つずつ入力してください。`,
@@ -725,6 +973,7 @@
   }
 
   function resetPhrases() {
+    syncStoredData();
     if (!confirmClearAllSiteCandidates()) return;
     clearAllSiteCandidates();
     managerCandidateQuery = '';
@@ -734,15 +983,14 @@
   function clearAllSiteCandidates() {
     saveCurrentSitePhrases([]);
     saveCurrentSitePinned([]);
-    delete history[siteKey];
-    saveHistory();
+    clearCurrentSiteHistory();
   }
 
   function clearSiteHistory() {
     if (!confirmClearSiteHistory()) return;
-    saveCurrentSitePhrases(getCurrentSiteCandidates().map((candidate) => candidate.value));
-    delete history[siteKey];
-    saveHistory();
+    syncStoredData();
+    mergeCurrentSitePhrases(getCurrentSiteCandidates().map((candidate) => candidate.value));
+    clearCurrentSiteHistory();
     updatePopup();
   }
 
@@ -760,17 +1008,20 @@
   }
 
   function toggleInputMode() {
+    inputMode = loadInputMode();
     inputMode = inputMode === 'setter' ? 'typing' : 'setter';
     writeValue(INPUT_MODE_KEY, inputMode);
     window.alert(`入力モードを「${inputModeLabel()}」にしました。`);
   }
 
   function toggleSiteEnabled() {
+    syncStoredData();
     setSiteDisabled(!isSiteDisabled());
     window.alert(`${siteKey} での機能を「${isSiteDisabled() ? '無効' : '有効'}」にしました。`);
   }
 
   function setSiteDisabled(disabled) {
+    disabledSites = loadDisabledSites();
     if (disabled) {
       disabledSites = [...new Set(disabledSites.concat(siteKey))];
       hidePopup();
@@ -785,6 +1036,7 @@
   }
 
   function toggleSuppressNativeAutocomplete() {
+    suppressNativeAutocomplete = loadSuppressNativeAutocomplete();
     suppressNativeAutocomplete = !suppressNativeAutocomplete;
     writeValue(SUPPRESS_NATIVE_KEY, suppressNativeAutocomplete);
     window.alert(`Chrome候補抑制を「${suppressNativeAutocomplete ? '有効' : '無効'}」にしました。`);
@@ -796,7 +1048,17 @@
 
   // --- 入力欄・候補検索の基本処理 ------------------------------------------
   function uniqueNonEmpty(items) {
-    return [...new Set(items.map((item) => item.trim()).filter(Boolean))];
+    const result = [];
+    const seen = new Set();
+    (Array.isArray(items) ? items : []).forEach((item) => {
+      const value = String(item || '').trim();
+      if (!value) return;
+      const key = normalize(value);
+      if (seen.has(key)) return;
+      seen.add(key);
+      result.push(value);
+    });
+    return result;
   }
 
   function isTextEntry(element) {
@@ -1121,23 +1383,17 @@
   }
 
   function deleteCandidateValue(value) {
-    saveCurrentSitePhrases(getCurrentSitePhrases().filter((phrase) => normalize(phrase) !== normalize(value)));
-    saveCurrentSitePinned(getCurrentSitePinned().filter((phrase) => normalize(phrase) !== normalize(value)));
+    removeCurrentSitePhrases([value]);
+    removeCurrentSitePinned([value]);
     deleteHistoryValue(value);
   }
 
   function deleteHistoryValue(value) {
-    const siteHistory = history[siteKey] || {};
-    const key = Object.keys(siteHistory).find((item) => normalize(item) === normalize(value));
-    if (!key) return;
-
-    delete siteHistory[key];
-    if (Object.keys(siteHistory).length) {
-      history[siteKey] = siteHistory;
-    } else {
-      delete history[siteKey];
-    }
-    saveHistory();
+    updateCurrentSiteHistory((siteHistory) => {
+      const key = Object.keys(siteHistory).find((item) => normalize(item) === normalize(value));
+      if (key) delete siteHistory[key];
+      return siteHistory;
+    });
   }
 
   async function copyValue(value) {
@@ -1192,6 +1448,8 @@
   // 右下の「設定」ボタンから開く管理画面。候補追加、CSV入出力、検索、ピン止め、削除を行う。
   function openManager() {
     hidePopup();
+    syncStoredData();
+    managerView = 'settings';
     renderManager();
     manager.hidden = false;
   }
@@ -1211,15 +1469,25 @@
     head.className = 'mac-manager-head';
 
     const title = document.createElement('h2');
-    title.textContent = '入力候補';
+    title.textContent = `サイト別入力候補オートコンプリート ver${SCRIPT_VERSION}`;
+
+    const headActions = document.createElement('div');
+    headActions.className = 'mac-manager-row';
+
+    const migrationButton = document.createElement('button');
+    migrationButton.type = 'button';
+    migrationButton.textContent = '移行';
+    migrationButton.addEventListener('click', openMigration);
 
     const closeButton = document.createElement('button');
     closeButton.type = 'button';
     closeButton.textContent = '閉じる';
     closeButton.addEventListener('click', closeManager);
 
+    headActions.appendChild(migrationButton);
+    headActions.appendChild(closeButton);
     head.appendChild(title);
-    head.appendChild(closeButton);
+    head.appendChild(headActions);
 
     const body = document.createElement('div');
     body.className = 'mac-manager-body';
@@ -1237,6 +1505,512 @@
     manager.appendChild(panel);
 
     manager.addEventListener('mousedown', closeManager, { once: true });
+  }
+
+  function openMigration() {
+    hidePopup();
+    syncStoredData();
+    managerView = 'migration';
+    migrationSiteQuery = '';
+    migrationSelectedSites = getMigrationSiteKeys();
+    migrationMessage = '';
+    renderMigration();
+    manager.hidden = false;
+  }
+
+  function renderMigration() {
+    manager.textContent = '';
+
+    const panel = document.createElement('div');
+    panel.className = 'mac-manager-panel';
+    panel.addEventListener('mousedown', (event) => event.stopPropagation());
+
+    const head = document.createElement('div');
+    head.className = 'mac-manager-head';
+
+    const title = document.createElement('h2');
+    title.textContent = '移行';
+
+    const headActions = document.createElement('div');
+    headActions.className = 'mac-manager-row';
+
+    const backButton = document.createElement('button');
+    backButton.type = 'button';
+    backButton.textContent = '設定へ戻る';
+    backButton.addEventListener('click', openManager);
+
+    const closeButton = document.createElement('button');
+    closeButton.type = 'button';
+    closeButton.textContent = '閉じる';
+    closeButton.addEventListener('click', closeManager);
+
+    headActions.appendChild(backButton);
+    headActions.appendChild(closeButton);
+    head.appendChild(title);
+    head.appendChild(headActions);
+
+    const body = document.createElement('div');
+    body.className = 'mac-manager-body mac-migration-body';
+    body.appendChild(createMigrationExportSection());
+    body.appendChild(createMigrationImportSection());
+
+    if (migrationMessage) {
+      const status = document.createElement('div');
+      status.className = 'mac-status';
+      status.textContent = migrationMessage;
+      body.appendChild(status);
+    }
+
+    panel.appendChild(head);
+    panel.appendChild(body);
+    manager.appendChild(panel);
+
+    manager.addEventListener('mousedown', closeManager, { once: true });
+  }
+
+  function createMigrationExportSection() {
+    const section = document.createElement('section');
+    section.className = 'mac-migration-section';
+    const heading = document.createElement('h3');
+    heading.textContent = 'JSONエクスポート';
+
+    const note = document.createElement('div');
+    note.className = 'mac-empty';
+    note.textContent = '候補名は常に含めます。社内共有では、個人の利用傾向が入る使用履歴は必要な場合だけ含めてください。';
+
+    const optionBox = document.createElement('div');
+    optionBox.className = 'mac-check-options';
+    optionBox.appendChild(createMigrationOption('ピン止めを含める', migrationIncludePinned, (checked) => {
+      migrationIncludePinned = checked;
+    }));
+    optionBox.appendChild(createMigrationOption('使用履歴を含める', migrationIncludeHistory, (checked) => {
+      migrationIncludeHistory = checked;
+    }));
+    optionBox.appendChild(createMigrationOption('基本設定を含める', migrationIncludeSettings, (checked) => {
+      migrationIncludeSettings = checked;
+    }));
+
+    const actions = document.createElement('div');
+    actions.className = 'mac-manager-row mac-migration-actions';
+
+    const selectAllButton = document.createElement('button');
+    selectAllButton.type = 'button';
+    selectAllButton.textContent = '全選択';
+    selectAllButton.addEventListener('click', () => {
+      migrationSelectedSites = getMigrationSiteKeys();
+      renderMigration();
+    });
+
+    const clearButton = document.createElement('button');
+    clearButton.type = 'button';
+    clearButton.textContent = '全解除';
+    clearButton.addEventListener('click', () => {
+      migrationSelectedSites = [];
+      renderMigration();
+    });
+
+    const currentButton = document.createElement('button');
+    currentButton.type = 'button';
+    currentButton.textContent = '現在サイトのみ';
+    currentButton.addEventListener('click', () => {
+      migrationSelectedSites = [siteKey];
+      renderMigration();
+    });
+
+    actions.appendChild(selectAllButton);
+    actions.appendChild(clearButton);
+    actions.appendChild(currentButton);
+
+    const searchRow = document.createElement('div');
+    searchRow.className = 'mac-manager-row mac-migration-search';
+
+    const searchInput = document.createElement('input');
+    searchInput.type = 'search';
+    searchInput.placeholder = 'サイトを検索';
+    searchInput.value = migrationSiteQuery;
+    searchInput.setAttribute('aria-label', '移行するサイトを検索');
+    searchInput.addEventListener('input', () => {
+      migrationSiteQuery = searchInput.value;
+      renderMigration();
+    });
+    searchRow.appendChild(searchInput);
+
+    const allSites = getMigrationSiteKeys();
+    const query = normalize(migrationSiteQuery);
+    const visibleSites = query
+      ? allSites.filter((site) => normalize(site).includes(query))
+      : allSites;
+
+    const countLine = document.createElement('div');
+    countLine.className = 'mac-empty';
+    countLine.textContent = `選択中 ${getSelectedMigrationSites().length.toLocaleString('ja-JP')}サイト / 全 ${allSites.length.toLocaleString('ja-JP')}サイト`;
+
+    const list = document.createElement('div');
+    list.className = 'mac-check-list';
+
+    if (!visibleSites.length) {
+      list.appendChild(emptyLine('一致するサイトはありません。'));
+    } else {
+      visibleSites.forEach((site) => {
+        list.appendChild(createMigrationSiteItem(site));
+      });
+    }
+
+    const exportRow = document.createElement('div');
+    exportRow.className = 'mac-manager-row mac-migration-actions';
+
+    const exportButton = document.createElement('button');
+    exportButton.type = 'button';
+    exportButton.className = 'mac-primary';
+    exportButton.textContent = 'JSONエクスポート';
+    exportButton.disabled = !getSelectedMigrationSites().length;
+    exportButton.addEventListener('click', exportMigrationJson);
+    exportRow.appendChild(exportButton);
+
+    section.appendChild(heading);
+    section.appendChild(note);
+    section.appendChild(optionBox);
+    section.appendChild(actions);
+    section.appendChild(searchRow);
+    section.appendChild(countLine);
+    section.appendChild(list);
+    section.appendChild(exportRow);
+    return section;
+  }
+
+  function createMigrationImportSection() {
+    const section = document.createElement('section');
+    section.className = 'mac-migration-section';
+    const heading = document.createElement('h3');
+    heading.textContent = 'JSONインポート';
+
+    const note = document.createElement('div');
+    note.className = 'mac-empty';
+    note.textContent = '既存データは消さずにマージします。使用回数は大きい方、最終使用日は新しい方を残します。';
+
+    const optionBox = document.createElement('div');
+    optionBox.className = 'mac-check-options';
+    optionBox.appendChild(createMigrationOption('ピン止めを取り込む', migrationImportIncludePinned, (checked) => {
+      migrationImportIncludePinned = checked;
+    }));
+    optionBox.appendChild(createMigrationOption('使用履歴を取り込む', migrationImportIncludeHistory, (checked) => {
+      migrationImportIncludeHistory = checked;
+    }));
+    optionBox.appendChild(createMigrationOption('基本設定を取り込む', migrationImportIncludeSettings, (checked) => {
+      migrationImportIncludeSettings = checked;
+    }));
+
+    const row = document.createElement('div');
+    row.className = 'mac-manager-row mac-migration-actions';
+
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.hidden = true;
+    input.addEventListener('change', () => {
+      const file = input.files && input.files[0];
+      if (!file) return;
+      importMigrationJson(file);
+      input.value = '';
+    });
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'mac-primary';
+    button.textContent = 'JSONインポート';
+    button.addEventListener('click', () => input.click());
+
+    row.appendChild(button);
+    section.appendChild(heading);
+    section.appendChild(note);
+    section.appendChild(optionBox);
+    section.appendChild(row);
+    section.appendChild(input);
+    return section;
+  }
+
+  function createMigrationOption(text, checked, onChange) {
+    const label = document.createElement('label');
+    label.className = 'mac-check-item';
+
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = checked;
+    input.addEventListener('change', () => onChange(input.checked));
+
+    const span = document.createElement('span');
+    span.className = 'mac-check-text';
+    span.textContent = text;
+
+    label.appendChild(input);
+    label.appendChild(span);
+    return label;
+  }
+
+  function createMigrationSiteItem(site) {
+    const label = document.createElement('label');
+    label.className = 'mac-check-item';
+
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = migrationSelectedSites.includes(site);
+    input.addEventListener('change', () => {
+      if (input.checked) {
+        migrationSelectedSites = uniqueNonEmpty(migrationSelectedSites.concat(site));
+      } else {
+        migrationSelectedSites = migrationSelectedSites.filter((item) => item !== site);
+      }
+      renderMigration();
+    });
+
+    const summary = getMigrationSiteSummary(site);
+    const text = document.createElement('span');
+    text.className = 'mac-check-text';
+    text.textContent = `${site} / 候補 ${summary.candidates.toLocaleString('ja-JP')}件 / ピン ${summary.pinned.toLocaleString('ja-JP')}件 / 履歴 ${summary.history.toLocaleString('ja-JP')}件`;
+
+    label.appendChild(input);
+    label.appendChild(text);
+    return label;
+  }
+
+  function getMigrationSiteKeys() {
+    const keys = new Set([
+      ...Object.keys(sitePhrases || {}),
+      ...Object.keys(history || {}),
+      ...Object.keys(pinned || {}),
+      ...disabledSites,
+    ]);
+    keys.add(siteKey);
+    return [...keys].filter(Boolean).sort((a, b) => a.localeCompare(b, 'ja'));
+  }
+
+  function getSelectedMigrationSites() {
+    const validSites = new Set(getMigrationSiteKeys());
+    return uniqueNonEmpty(migrationSelectedSites).filter((site) => validSites.has(site));
+  }
+
+  function getMigrationSiteSummary(site) {
+    return {
+      candidates: getSitePhrases(site).length,
+      pinned: getSitePinned(site).length,
+      history: Object.keys(getSiteHistory(site)).length,
+    };
+  }
+
+  function getSitePhrases(site) {
+    const current = sitePhrases && sitePhrases[site];
+    return Array.isArray(current) ? uniqueNonEmpty(current) : [];
+  }
+
+  function getSitePinned(site) {
+    const current = pinned && pinned[site];
+    return Array.isArray(current) ? uniqueNonEmpty(current) : [];
+  }
+
+  function getSiteHistory(site) {
+    const current = history && history[site];
+    return current && typeof current === 'object' && !Array.isArray(current) ? current : {};
+  }
+
+  function exportMigrationJson() {
+    syncStoredData();
+    const selectedSites = getSelectedMigrationSites();
+    if (!selectedSites.length) {
+      window.alert('エクスポートするサイトを選択してください。');
+      return;
+    }
+
+    const payload = buildMigrationPayload(selectedSites);
+    downloadJson(payload, `site-input-autocomplete-migration-${formatDateForFilename()}.json`);
+    migrationMessage = `${selectedSites.length.toLocaleString('ja-JP')}サイト分をJSONエクスポートしました。`;
+    renderMigration();
+  }
+
+  function buildMigrationPayload(selectedSites) {
+    const sites = {};
+    selectedSites.forEach((site) => {
+      const phrases = getSitePhrases(site);
+      const pinnedEntries = migrationIncludePinned ? getSitePinned(site) : [];
+      const historyEntries = migrationIncludeHistory ? sanitizeHistoryMap(getSiteHistory(site)) : {};
+      const candidates = uniqueNonEmpty([
+        ...phrases,
+        ...pinnedEntries,
+        ...Object.keys(historyEntries),
+      ]);
+
+      sites[site] = { candidates };
+      if (migrationIncludePinned) {
+        sites[site].pinned = uniqueNonEmpty(pinnedEntries);
+      }
+      if (migrationIncludeHistory) {
+        sites[site].history = historyEntries;
+      }
+    });
+
+    const payload = {
+      schema: MIGRATION_SCHEMA,
+      version: MIGRATION_VERSION,
+      exportedAt: new Date().toISOString(),
+      sourceSite: siteKey,
+      sites,
+    };
+
+    if (migrationIncludeSettings) {
+      const selected = new Set(selectedSites);
+      payload.settings = {
+        inputMode,
+        suppressNativeAutocomplete,
+        historyLimitPerSite,
+        disabledSites: disabledSites.filter((site) => selected.has(site)),
+      };
+    }
+
+    return payload;
+  }
+
+  function downloadJson(payload, filename) {
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    document.documentElement.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function importMigrationJson(file) {
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text);
+      const result = applyMigrationPayload(payload);
+      syncStoredData();
+      migrationMessage = `JSONインポート完了: ${result.sites.toLocaleString('ja-JP')}サイト / 候補 ${result.candidates.toLocaleString('ja-JP')}件 / ピン ${result.pinned.toLocaleString('ja-JP')}件 / 履歴 ${result.history.toLocaleString('ja-JP')}件`;
+      window.alert(migrationMessage);
+      renderMigration();
+      updatePopup();
+    } catch (error) {
+      migrationMessage = `JSONインポートに失敗しました: ${error && error.message ? error.message : error}`;
+      window.alert(migrationMessage);
+      renderMigration();
+    }
+  }
+
+  function applyMigrationPayload(payload) {
+    if (!payload || payload.schema !== MIGRATION_SCHEMA || !payload.sites || typeof payload.sites !== 'object' || Array.isArray(payload.sites)) {
+      throw new Error('このツール用のJSONではありません。');
+    }
+
+    const nextPhrases = loadSitePhrases();
+    const nextPinned = loadPinned();
+    const nextHistory = loadHistory();
+    const result = { sites: 0, candidates: 0, pinned: 0, history: 0 };
+
+    Object.entries(payload.sites).forEach(([site, rawSiteData]) => {
+      const cleanSite = String(site || '').trim();
+      if (!cleanSite || !rawSiteData || typeof rawSiteData !== 'object' || Array.isArray(rawSiteData)) return;
+
+      const importedPinned = migrationImportIncludePinned ? uniqueNonEmpty(rawSiteData.pinned || []) : [];
+      const importedHistory = migrationImportIncludeHistory ? sanitizeHistoryMap(rawSiteData.history || {}) : {};
+      const importedCandidates = uniqueNonEmpty([
+        ...(Array.isArray(rawSiteData.candidates) ? rawSiteData.candidates : []),
+        ...(Array.isArray(rawSiteData.phrases) ? rawSiteData.phrases : []),
+        ...importedPinned,
+        ...Object.keys(importedHistory),
+      ]);
+
+      if (!importedCandidates.length && !importedPinned.length && !Object.keys(importedHistory).length) return;
+      result.sites += 1;
+
+      const currentPhrases = Array.isArray(nextPhrases[cleanSite]) ? uniqueNonEmpty(nextPhrases[cleanSite]) : [];
+      const mergedPhrases = uniqueNonEmpty(currentPhrases.concat(importedCandidates));
+      nextPhrases[cleanSite] = mergedPhrases;
+      result.candidates += Math.max(0, mergedPhrases.length - currentPhrases.length);
+
+      if (migrationImportIncludePinned && importedPinned.length) {
+        const currentPinned = Array.isArray(nextPinned[cleanSite]) ? uniqueNonEmpty(nextPinned[cleanSite]) : [];
+        const mergedPinned = uniqueNonEmpty(currentPinned.concat(importedPinned));
+        nextPinned[cleanSite] = mergedPinned;
+        result.pinned += Math.max(0, mergedPinned.length - currentPinned.length);
+      }
+
+      if (migrationImportIncludeHistory && Object.keys(importedHistory).length) {
+        const currentHistory = nextHistory[cleanSite] && typeof nextHistory[cleanSite] === 'object' && !Array.isArray(nextHistory[cleanSite])
+          ? { ...nextHistory[cleanSite] }
+          : {};
+        Object.entries(importedHistory).forEach(([value, stat]) => {
+          const existingKey = Object.keys(currentHistory).find((key) => normalize(key) === normalize(value));
+          const key = existingKey || value;
+          const current = currentHistory[key] || { count: 0, lastUsed: 0 };
+          currentHistory[key] = {
+            count: Math.max(Number(current.count) || 0, Number(stat.count) || 0),
+            lastUsed: Math.max(Number(current.lastUsed) || 0, Number(stat.lastUsed) || 0),
+          };
+        });
+        nextHistory[cleanSite] = trimHistory(currentHistory);
+        result.history += Object.keys(importedHistory).length;
+      }
+    });
+
+    sitePhrases = nextPhrases;
+    pinned = nextPinned;
+    history = nextHistory;
+    writeValue(SITE_PHRASES_KEY, sitePhrases);
+    writeValue(PINNED_KEY, pinned);
+    writeValue(HISTORY_KEY, history);
+
+    if (migrationImportIncludeSettings && payload.settings && typeof payload.settings === 'object') {
+      applyMigrationSettings(payload.settings);
+    }
+
+    return result;
+  }
+
+  function applyMigrationSettings(settings) {
+    if (settings.inputMode === 'setter' || settings.inputMode === 'typing') {
+      inputMode = settings.inputMode;
+      writeValue(INPUT_MODE_KEY, inputMode);
+    }
+    if (typeof settings.suppressNativeAutocomplete === 'boolean') {
+      suppressNativeAutocomplete = settings.suppressNativeAutocomplete;
+      writeValue(SUPPRESS_NATIVE_KEY, suppressNativeAutocomplete);
+    }
+    if (HISTORY_LIMIT_OPTIONS.includes(Number(settings.historyLimitPerSite))) {
+      historyLimitPerSite = Number(settings.historyLimitPerSite);
+      writeValue(HISTORY_LIMIT_KEY, historyLimitPerSite);
+    }
+    if (Array.isArray(settings.disabledSites)) {
+      disabledSites = uniqueNonEmpty(loadDisabledSites().concat(settings.disabledSites));
+      writeValue(DISABLED_SITES_KEY, disabledSites);
+    }
+  }
+
+  function sanitizeHistoryMap(rawHistory) {
+    const result = {};
+    if (!rawHistory || typeof rawHistory !== 'object' || Array.isArray(rawHistory)) return result;
+
+    Object.entries(rawHistory).forEach(([value, stat]) => {
+      const name = String(value || '').trim();
+      if (!name || !stat || typeof stat !== 'object') return;
+      const count = Math.max(0, Math.floor(Number(stat.count) || 0));
+      const lastUsed = parseMigrationTime(stat.lastUsed);
+      if (!count && !lastUsed) return;
+      result[name] = { count, lastUsed };
+    });
+
+    return result;
+  }
+
+  function parseMigrationTime(value) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number > 0) return number;
+    const parsed = Date.parse(String(value || ''));
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
+  function formatDateForFilename() {
+    return new Date().toISOString().slice(0, 10).replaceAll('-', '');
   }
 
   function createSiteEnabledSection() {
@@ -1276,6 +2050,7 @@
     button.type = 'button';
     button.textContent = '切り替え';
     button.addEventListener('click', () => {
+      inputMode = loadInputMode();
       inputMode = inputMode === 'setter' ? 'typing' : 'setter';
       writeValue(INPUT_MODE_KEY, inputMode);
       renderManager();
@@ -1300,6 +2075,7 @@
     button.type = 'button';
     button.textContent = '切り替え';
     button.addEventListener('click', () => {
+      suppressNativeAutocomplete = loadSuppressNativeAutocomplete();
       suppressNativeAutocomplete = !suppressNativeAutocomplete;
       writeValue(SUPPRESS_NATIVE_KEY, suppressNativeAutocomplete);
       if (activeInput) {
@@ -1339,6 +2115,7 @@
     select.addEventListener('change', () => {
       historyLimitPerSite = Number(select.value) || DEFAULT_HISTORY_LIMIT_PER_SITE;
       writeValue(HISTORY_LIMIT_KEY, historyLimitPerSite);
+      history = loadHistory();
       trimAllHistory();
       saveHistory();
       renderManager();
@@ -1371,7 +2148,7 @@
     const add = () => {
       const value = input.value.trim();
       if (!value) return;
-      saveCurrentSitePhrases(getCurrentSitePhrases().concat(value));
+      addCurrentSitePhrase(value);
       renderManager();
     };
 
@@ -1580,8 +2357,9 @@
         return;
       }
 
+      syncStoredData();
       const before = getCurrentSitePhrases().length;
-      saveCurrentSitePhrases(getCurrentSitePhrases().concat(imported));
+      mergeCurrentSitePhrases(imported);
       importUsageStats(result.entries);
       importPinnedState(result.entries);
       const added = getCurrentSitePhrases().length - before;
@@ -1737,25 +2515,24 @@
     const stats = entries.filter((entry) => entry.count > 0 || entry.lastUsed > 0);
     if (!stats.length) return;
 
-    const siteHistory = history[siteKey] || {};
-    stats.forEach((entry) => {
-      const existingKey = Object.keys(siteHistory).find((key) => normalize(key) === normalize(entry.value));
-      const key = existingKey || entry.value;
-      const current = siteHistory[key] || { count: 0, lastUsed: 0 };
-      siteHistory[key] = {
-        count: Math.max(Number(current.count) || 0, Number(entry.count) || 0),
-        lastUsed: Math.max(Number(current.lastUsed) || 0, Number(entry.lastUsed) || 0),
-      };
+    updateCurrentSiteHistory((siteHistory) => {
+      stats.forEach((entry) => {
+        const existingKey = Object.keys(siteHistory).find((key) => normalize(key) === normalize(entry.value));
+        const key = existingKey || entry.value;
+        const current = siteHistory[key] || { count: 0, lastUsed: 0 };
+        siteHistory[key] = {
+          count: Math.max(Number(current.count) || 0, Number(entry.count) || 0),
+          lastUsed: Math.max(Number(current.lastUsed) || 0, Number(entry.lastUsed) || 0),
+        };
+      });
+      return siteHistory;
     });
-
-    history[siteKey] = trimHistory(siteHistory);
-    saveHistory();
   }
 
   function importPinnedState(entries) {
     const pinnedEntries = entries.filter((entry) => entry.pinned).map((entry) => entry.value);
     if (!pinnedEntries.length) return;
-    saveCurrentSitePinned(getCurrentSitePinned().concat(pinnedEntries));
+    mergeCurrentSitePinned(pinnedEntries);
   }
 
   function formatCsvImportMessage(readCount, added, skippedRows) {
@@ -1809,6 +2586,7 @@
   }
 
   function exportPhrasesToCsv() {
+    syncStoredData();
     const rows = [
       ['name', 'count', 'lastUsed', 'pinned'],
       ...getCurrentSiteCandidates().map((candidate) => [
@@ -1853,13 +2631,14 @@
 
   function clearSiteHistoryFromManager() {
     if (!confirmClearSiteHistory()) return;
-    saveCurrentSitePhrases(getCurrentSiteCandidates().map((candidate) => candidate.value));
-    delete history[siteKey];
-    saveHistory();
+    syncStoredData();
+    mergeCurrentSitePhrases(getCurrentSiteCandidates().map((candidate) => candidate.value));
+    clearCurrentSiteHistory();
     renderManager();
   }
 
   function clearAllSiteCandidatesFromManager() {
+    syncStoredData();
     if (!confirmClearAllSiteCandidates()) return;
     clearAllSiteCandidates();
     managerCandidateQuery = '';
@@ -2057,18 +2836,18 @@
     addCurrentSitePhrase(value);
 
     const normalized = normalize(value);
-    const siteHistory = history[siteKey] || {};
-    const existingKey = Object.keys(siteHistory).find((key) => normalize(key) === normalized);
-    const key = existingKey || value;
-    const current = siteHistory[key] || { count: 0, lastUsed: 0 };
+    updateCurrentSiteHistory((siteHistory) => {
+      const existingKey = Object.keys(siteHistory).find((key) => normalize(key) === normalized);
+      const key = existingKey || value;
+      const current = siteHistory[key] || { count: 0, lastUsed: 0 };
 
-    siteHistory[key] = {
-      count: (Number(current.count) || 0) + 1,
-      lastUsed: Date.now(),
-    };
+      siteHistory[key] = {
+        count: (Number(current.count) || 0) + 1,
+        lastUsed: Date.now(),
+      };
 
-    history[siteKey] = trimHistory(siteHistory);
-    saveHistory();
+      return siteHistory;
+    });
   }
 
   function recordEntriesForAction(trigger) {
