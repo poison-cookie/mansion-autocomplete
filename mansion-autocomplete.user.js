@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Site Input Autocomplete
 // @namespace    local.site-input-autocomplete
-// @version      1.7.2
+// @version      1.7.7
 // @description  Add a custom autocomplete picker with site-specific candidates and usage counts.
 // @homepageURL   https://github.com/poison-cookie/mansion-autocomplete
 // @updateURL     https://raw.githubusercontent.com/poison-cookie/mansion-autocomplete/main/mansion-autocomplete.user.js
@@ -29,7 +29,8 @@
   const SUPPRESS_NATIVE_KEY = 'mansionAutocomplete.suppressNative.v1';
   const DISABLED_SITES_KEY = 'mansionAutocomplete.disabledSites.v1';
   const HISTORY_LIMIT_KEY = 'mansionAutocomplete.historyLimit.v1';
-  const SCRIPT_VERSION = '1.7.2';
+  const MANAGER_BUTTON_POSITION_KEY = 'mansionAutocomplete.managerButtonPosition.v1';
+  const SCRIPT_VERSION = '1.7.7';
   const MIGRATION_SCHEMA = 'site-input-autocomplete';
   const MIGRATION_VERSION = 1;
   const SYNC_STORAGE_KEYS = [
@@ -40,6 +41,7 @@
     SUPPRESS_NATIVE_KEY,
     DISABLED_SITES_KEY,
     HISTORY_LIMIT_KEY,
+    MANAGER_BUTTON_POSITION_KEY,
   ];
   const MAX_RESULTS = 12;
   const DEFAULT_HISTORY_LIMIT_PER_SITE = 5000;
@@ -81,6 +83,9 @@
   let migrationImportIncludeHistory = false;
   let migrationImportIncludeSettings = true;
   let migrationMessage = '';
+  let migrationPendingImport = null;
+  let managerButtonPosition = loadManagerButtonPosition();
+  let managerButtonDrag = null;
 
   const uiHost = document.createElement('div');
   uiHost.id = 'mansion-autocomplete-ui-host';
@@ -89,7 +94,7 @@
   const managerButton = document.createElement('button');
   managerButton.id = 'mansion-autocomplete-manager-button';
   managerButton.type = 'button';
-  managerButton.textContent = '設定';
+  managerButton.textContent = '設 定';
   managerButton.title = '入力候補の設定';
 
   const manager = document.createElement('div');
@@ -217,6 +222,12 @@
       color: #b91c1c;
       font-size: 13px;
     }
+    #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-menu .mac-delete {
+      color: #991b1b;
+    }
+    #mansion-autocomplete-popup .mac-item[aria-selected="true"] .mac-menu .mac-delete:hover {
+      color: #7f1d1d;
+    }
     #mansion-autocomplete-popup .mac-item[aria-selected="true"] {
       background: #1d4ed8;
       color: #fff;
@@ -293,17 +304,22 @@
       right: 14px;
       bottom: 14px;
       z-index: 2147483646;
-      border: 1px solid #1d4ed8;
+      border: 1px solid #9ca3af;
       border-radius: 999px;
-      padding: 9px 18px;
-      background: #1d4ed8;
+      padding: 10px 24px;
+      background: #4b5563;
       color: #fff;
       font-size: 13px;
       font-weight: 600;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.08em;
       line-height: 1;
       box-shadow: 0 8px 24px rgba(15, 23, 42, 0.22);
-      cursor: pointer;
+      cursor: grab;
+      user-select: none;
+      touch-action: none;
+    }
+    #mansion-autocomplete-manager-button:active {
+      cursor: grabbing;
     }
     #mansion-autocomplete-manager {
       position: fixed;
@@ -517,6 +533,25 @@
       color: #166534;
       font-size: 12px;
     }
+    #mansion-autocomplete-manager .mac-preview {
+      display: grid;
+      gap: 6px;
+      padding: 11px 12px;
+      border: 1px solid #bfdbfe;
+      border-radius: 6px;
+      background: #eff6ff;
+      color: #1e3a8a;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    #mansion-autocomplete-manager .mac-preview-title {
+      color: #1e40af;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    #mansion-autocomplete-manager .mac-preview-line {
+      overflow-wrap: anywhere;
+    }
     @media (max-width: 560px) {
       #mansion-autocomplete-manager {
         padding: 8px;
@@ -542,6 +577,8 @@
   uiRoot.appendChild(manager);
   uiRoot.appendChild(popup);
   document.documentElement.appendChild(uiHost);
+  applyManagerButtonPosition();
+  updateManagerButtonVisibility();
 
   if (typeof GM_registerMenuCommand === 'function') {
     // Tampermonkey の拡張機能メニューからも主要操作を実行できるようにする。
@@ -555,7 +592,21 @@
     GM_registerMenuCommand('このサイトの使用回数をリセット', clearSiteHistory);
   }
 
-  managerButton.addEventListener('click', openManager);
+  managerButton.addEventListener('pointerdown', startManagerButtonDrag);
+  managerButton.addEventListener('click', (event) => {
+    if (managerButtonDrag && managerButtonDrag.wasDragged) {
+      event.preventDefault();
+      event.stopPropagation();
+      managerButtonDrag = null;
+      return;
+    }
+    managerButtonDrag = null;
+    if (isSiteDisabled()) {
+      updateManagerButtonVisibility();
+      return;
+    }
+    openManager();
+  });
   setupStorageSync();
 
   // 入力欄にフォーカスしたら候補ポップアップを表示する。
@@ -652,7 +703,10 @@
     recordEntriesForAction(action);
   }, true);
 
-  window.addEventListener('resize', positionPopup);
+  window.addEventListener('resize', () => {
+    positionPopup();
+    applyManagerButtonPosition();
+  });
   window.addEventListener('scroll', positionPopup, true);
 
   // --- 保存データの読み書き -------------------------------------------------
@@ -831,6 +885,20 @@
     return HISTORY_LIMIT_OPTIONS.includes(saved) ? saved : DEFAULT_HISTORY_LIMIT_PER_SITE;
   }
 
+  function loadManagerButtonPosition() {
+    const saved = readValue(MANAGER_BUTTON_POSITION_KEY, null);
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return null;
+    const left = Number(saved.left);
+    const top = Number(saved.top);
+    if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+    return { left, top };
+  }
+
+  function saveManagerButtonPosition(position) {
+    managerButtonPosition = position;
+    writeValue(MANAGER_BUTTON_POSITION_KEY, managerButtonPosition);
+  }
+
   function saveDisabledSites() {
     writeValue(DISABLED_SITES_KEY, [...new Set(disabledSites)]);
   }
@@ -939,13 +1007,21 @@
     suppressNativeAutocomplete = loadSuppressNativeAutocomplete();
     disabledSites = loadDisabledSites();
     historyLimitPerSite = loadHistoryLimitPerSite();
+    managerButtonPosition = loadManagerButtonPosition();
+    applyManagerButtonPosition();
+    updateManagerButtonVisibility();
   }
 
   function refreshUiAfterStorageSync() {
+    const managerOpen = !manager.hidden;
+    if (managerOpen) {
+      hidePopup();
+    }
+
     if (isSiteDisabled()) {
       hidePopup();
       if (activeInput) restoreEntryAttributes(activeInput);
-    } else if (activeInput && isTextEntry(activeInput)) {
+    } else if (!managerOpen && activeInput && isTextEntry(activeInput)) {
       applyNativeAutocompleteSuppression(activeInput);
       updatePopup();
     }
@@ -1033,6 +1109,7 @@
       }
     }
     saveDisabledSites();
+    updateManagerButtonVisibility();
   }
 
   function toggleSuppressNativeAutocomplete() {
@@ -1120,13 +1197,47 @@
   function rankValue(value, query) {
     if (!query.compact) return 0;
     const searchable = normalizeForSearch(value);
-    if (searchable === query.compact) return 0;
-    if (searchable.startsWith(query.compact)) return 1;
-    if (query.tokens.length > 1 && query.tokens.every((token) => searchable.startsWith(token) || searchable.includes(token))) {
-      return query.tokens[0] && searchable.startsWith(query.tokens[0]) ? 2 : 3;
+    const compactIndex = searchable.indexOf(query.compact);
+    const tokenPositions = query.tokens.map((token) => searchable.indexOf(token));
+    const firstTokenPosition = tokenPositions[0] ?? -1;
+    let score = 0;
+
+    if (searchable === query.compact) {
+      score += 0;
+    } else if (searchable.startsWith(query.compact)) {
+      score += 20;
+    } else if (compactIndex >= 0) {
+      score += 60 + compactIndex;
+    } else if (firstTokenPosition === 0) {
+      score += 95;
+    } else if (tokenPositions.some((position) => position === 0)) {
+      score += 125;
+    } else {
+      score += 170;
     }
-    if (query.tokens.some((token) => searchable.startsWith(token))) return 4;
-    return 5;
+
+    if (query.tokens.length > 1) {
+      score += tokenOrderPenalty(query.tokens, tokenPositions, searchable.length);
+    }
+
+    score += Math.min(80, Math.max(0, searchable.length - query.compact.length) * 2);
+    score += Math.min(40, firstTokenPosition > 0 ? firstTokenPosition : 0);
+    return score;
+  }
+
+  function tokenOrderPenalty(tokens, positions, fallbackLength) {
+    if (!tokens.length) return 0;
+    if (positions.some((position) => position < 0)) return 500;
+
+    const ordered = positions.every((position, index) => index === 0 || position >= positions[index - 1]);
+    const start = Math.min(...positions);
+    const end = Math.max(...positions.map((position, index) => position + tokens[index].length));
+    const tokenLength = tokens.reduce((sum, token) => sum + token.length, 0);
+    const gap = Math.max(0, end - start - tokenLength);
+
+    return (ordered ? 0 : 120) +
+      Math.min(90, gap * 3) +
+      Math.min(40, start || fallbackLength);
   }
 
   function compareMatch(a, b) {
@@ -1444,6 +1555,76 @@
     }
   }
 
+  function startManagerButtonDrag(event) {
+    if (event.button !== undefined && event.button !== 0) return;
+
+    const rect = managerButton.getBoundingClientRect();
+    managerButtonDrag = {
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top,
+      wasDragged: false,
+    };
+
+    managerButton.setPointerCapture(event.pointerId);
+    managerButton.addEventListener('pointermove', moveManagerButtonDrag);
+    managerButton.addEventListener('pointerup', finishManagerButtonDrag);
+    managerButton.addEventListener('pointercancel', finishManagerButtonDrag);
+  }
+
+  function moveManagerButtonDrag(event) {
+    if (!managerButtonDrag || event.pointerId !== managerButtonDrag.pointerId) return;
+
+    const distance = Math.hypot(
+      event.clientX - managerButtonDrag.startClientX,
+      event.clientY - managerButtonDrag.startClientY
+    );
+    if (distance > 4) managerButtonDrag.wasDragged = true;
+    if (!managerButtonDrag.wasDragged) return;
+
+    event.preventDefault();
+    setManagerButtonPosition(event.clientX - managerButtonDrag.offsetX, event.clientY - managerButtonDrag.offsetY);
+  }
+
+  function finishManagerButtonDrag(event) {
+    if (!managerButtonDrag || event.pointerId !== managerButtonDrag.pointerId) return;
+
+    managerButton.releasePointerCapture(event.pointerId);
+    managerButton.removeEventListener('pointermove', moveManagerButtonDrag);
+    managerButton.removeEventListener('pointerup', finishManagerButtonDrag);
+    managerButton.removeEventListener('pointercancel', finishManagerButtonDrag);
+
+    if (managerButtonDrag.wasDragged) {
+      const rect = managerButton.getBoundingClientRect();
+      saveManagerButtonPosition({ left: Math.round(rect.left), top: Math.round(rect.top) });
+    }
+  }
+
+  function applyManagerButtonPosition() {
+    if (!managerButtonPosition) return;
+    setManagerButtonPosition(managerButtonPosition.left, managerButtonPosition.top);
+  }
+
+  function updateManagerButtonVisibility() {
+    managerButton.hidden = isSiteDisabled();
+  }
+
+  function setManagerButtonPosition(left, top) {
+    const rect = managerButton.getBoundingClientRect();
+    const gap = 8;
+    const maxLeft = Math.max(gap, window.innerWidth - rect.width - gap);
+    const maxTop = Math.max(gap, window.innerHeight - rect.height - gap);
+    const nextLeft = Math.min(Math.max(gap, Number(left) || gap), maxLeft);
+    const nextTop = Math.min(Math.max(gap, Number(top) || gap), maxTop);
+
+    managerButton.style.left = `${nextLeft}px`;
+    managerButton.style.top = `${nextTop}px`;
+    managerButton.style.right = 'auto';
+    managerButton.style.bottom = 'auto';
+  }
+
   // --- 設定画面 -------------------------------------------------------------
   // 右下の「設定」ボタンから開く管理画面。候補追加、CSV入出力、検索、ピン止め、削除を行う。
   function openManager() {
@@ -1645,6 +1826,8 @@
     countLine.className = 'mac-empty';
     countLine.textContent = `選択中 ${getSelectedMigrationSites().length.toLocaleString('ja-JP')}サイト / 全 ${allSites.length.toLocaleString('ja-JP')}サイト`;
 
+    const exportPreview = createMigrationPreview('エクスポート内容プレビュー', buildExportPreviewLines());
+
     const list = document.createElement('div');
     list.className = 'mac-check-list';
 
@@ -1673,6 +1856,7 @@
     section.appendChild(actions);
     section.appendChild(searchRow);
     section.appendChild(countLine);
+    section.appendChild(exportPreview);
     section.appendChild(list);
     section.appendChild(exportRow);
     return section;
@@ -1725,8 +1909,52 @@
     section.appendChild(note);
     section.appendChild(optionBox);
     section.appendChild(row);
+    if (migrationPendingImport) {
+      section.appendChild(createMigrationPreview('インポート内容確認', migrationPendingImport.summary.lines));
+
+      const confirmRow = document.createElement('div');
+      confirmRow.className = 'mac-manager-row mac-migration-actions';
+
+      const confirmButton = document.createElement('button');
+      confirmButton.type = 'button';
+      confirmButton.className = 'mac-primary';
+      confirmButton.textContent = 'この内容をインポート';
+      confirmButton.addEventListener('click', applyPendingMigrationImport);
+
+      const cancelButton = document.createElement('button');
+      cancelButton.type = 'button';
+      cancelButton.textContent = 'キャンセル';
+      cancelButton.addEventListener('click', () => {
+        migrationPendingImport = null;
+        migrationMessage = 'JSONインポートをキャンセルしました。';
+        renderMigration();
+      });
+
+      confirmRow.appendChild(confirmButton);
+      confirmRow.appendChild(cancelButton);
+      section.appendChild(confirmRow);
+    }
     section.appendChild(input);
     return section;
+  }
+
+  function createMigrationPreview(title, lines) {
+    const box = document.createElement('div');
+    box.className = 'mac-preview';
+
+    const head = document.createElement('div');
+    head.className = 'mac-preview-title';
+    head.textContent = title;
+    box.appendChild(head);
+
+    lines.forEach((line) => {
+      const item = document.createElement('div');
+      item.className = 'mac-preview-line';
+      item.textContent = line;
+      box.appendChild(item);
+    });
+
+    return box;
   }
 
   function createMigrationOption(text, checked, onChange) {
@@ -1736,7 +1964,13 @@
     const input = document.createElement('input');
     input.type = 'checkbox';
     input.checked = checked;
-    input.addEventListener('change', () => onChange(input.checked));
+    input.addEventListener('change', () => {
+      onChange(input.checked);
+      if (migrationPendingImport) {
+        migrationPendingImport.summary = buildImportPreview(migrationPendingImport.payload);
+      }
+      renderMigration();
+    });
 
     const span = document.createElement('span');
     span.className = 'mac-check-text';
@@ -1812,6 +2046,87 @@
     return current && typeof current === 'object' && !Array.isArray(current) ? current : {};
   }
 
+  function buildExportPreviewLines() {
+    const selectedSites = getSelectedMigrationSites();
+    const summary = selectedSites.reduce((total, site) => {
+      const historyEntries = migrationIncludeHistory ? sanitizeHistoryMap(getSiteHistory(site)) : {};
+      const candidates = uniqueNonEmpty([
+        ...getSitePhrases(site),
+        ...(migrationIncludePinned ? getSitePinned(site) : []),
+        ...Object.keys(historyEntries),
+      ]);
+      total.candidates += candidates.length;
+      total.pinned += migrationIncludePinned ? getSitePinned(site).length : 0;
+      total.history += Object.keys(historyEntries).length;
+      return total;
+    }, { candidates: 0, pinned: 0, history: 0 });
+
+    return [
+      `対象サイト: ${selectedSites.length.toLocaleString('ja-JP')}件`,
+      `候補名: ${summary.candidates.toLocaleString('ja-JP')}件`,
+      `ピン止め: ${migrationIncludePinned ? `${summary.pinned.toLocaleString('ja-JP')}件を含める` : '含めない'}`,
+      `使用履歴: ${migrationIncludeHistory ? `${summary.history.toLocaleString('ja-JP')}件を含める` : '含めない'}`,
+      `基本設定: ${migrationIncludeSettings ? '含める' : '含めない'}`,
+      `出力サイト: ${formatSiteList(selectedSites)}`,
+    ];
+  }
+
+  function buildImportPreview(payload) {
+    if (!payload || payload.schema !== MIGRATION_SCHEMA || !payload.sites || typeof payload.sites !== 'object' || Array.isArray(payload.sites)) {
+      throw new Error('このツール用のJSONではありません。');
+    }
+
+    const siteEntries = Object.entries(payload.sites)
+      .map(([site, rawSiteData]) => {
+        const cleanSite = String(site || '').trim();
+        if (!cleanSite || !rawSiteData || typeof rawSiteData !== 'object' || Array.isArray(rawSiteData)) return null;
+
+        const importedPinned = migrationImportIncludePinned ? uniqueNonEmpty(rawSiteData.pinned || []) : [];
+        const importedHistory = migrationImportIncludeHistory ? sanitizeHistoryMap(rawSiteData.history || {}) : {};
+        const importedCandidates = uniqueNonEmpty([
+          ...(Array.isArray(rawSiteData.candidates) ? rawSiteData.candidates : []),
+          ...(Array.isArray(rawSiteData.phrases) ? rawSiteData.phrases : []),
+          ...importedPinned,
+          ...Object.keys(importedHistory),
+        ]);
+
+        return {
+          site: cleanSite,
+          candidates: importedCandidates.length,
+          pinned: importedPinned.length,
+          history: Object.keys(importedHistory).length,
+        };
+      })
+      .filter(Boolean)
+      .filter((entry) => entry.candidates || entry.pinned || entry.history);
+
+    const totals = siteEntries.reduce((sum, entry) => {
+      sum.candidates += entry.candidates;
+      sum.pinned += entry.pinned;
+      sum.history += entry.history;
+      return sum;
+    }, { candidates: 0, pinned: 0, history: 0 });
+
+    return {
+      siteEntries,
+      lines: [
+        `対象サイト: ${siteEntries.length.toLocaleString('ja-JP')}件`,
+        `候補名: ${totals.candidates.toLocaleString('ja-JP')}件をマージ`,
+        `ピン止め: ${migrationImportIncludePinned ? `${totals.pinned.toLocaleString('ja-JP')}件を取り込む` : '取り込まない'}`,
+        `使用履歴: ${migrationImportIncludeHistory ? `${totals.history.toLocaleString('ja-JP')}件を取り込む` : '取り込まない'}`,
+        `基本設定: ${migrationImportIncludeSettings && payload.settings ? '取り込む' : '取り込まない'}`,
+        `対象サイト: ${formatSiteList(siteEntries.map((entry) => entry.site))}`,
+      ],
+    };
+  }
+
+  function formatSiteList(sites) {
+    if (!sites.length) return 'なし';
+    const shown = sites.slice(0, 6).join('、');
+    const rest = sites.length > 6 ? `、ほか${(sites.length - 6).toLocaleString('ja-JP')}件` : '';
+    return `${shown}${rest}`;
+  }
+
   function exportMigrationJson() {
     syncStoredData();
     const selectedSites = getSelectedMigrationSites();
@@ -1884,12 +2199,28 @@
     try {
       const text = await file.text();
       const payload = JSON.parse(text);
-      const result = applyMigrationPayload(payload);
+      const summary = buildImportPreview(payload);
+      migrationPendingImport = { payload, summary };
+      migrationMessage = 'JSONを読み込みました。内容を確認してからインポートしてください。';
+      renderMigration();
+    } catch (error) {
+      migrationPendingImport = null;
+      migrationMessage = `JSONインポートに失敗しました: ${error && error.message ? error.message : error}`;
+      window.alert(migrationMessage);
+      renderMigration();
+    }
+  }
+
+  function applyPendingMigrationImport() {
+    if (!migrationPendingImport) return;
+    try {
+      const result = applyMigrationPayload(migrationPendingImport.payload);
+      migrationPendingImport = null;
       syncStoredData();
       migrationMessage = `JSONインポート完了: ${result.sites.toLocaleString('ja-JP')}サイト / 候補 ${result.candidates.toLocaleString('ja-JP')}件 / ピン ${result.pinned.toLocaleString('ja-JP')}件 / 履歴 ${result.history.toLocaleString('ja-JP')}件`;
       window.alert(migrationMessage);
+      hidePopup();
       renderMigration();
-      updatePopup();
     } catch (error) {
       migrationMessage = `JSONインポートに失敗しました: ${error && error.message ? error.message : error}`;
       window.alert(migrationMessage);
@@ -2669,7 +3000,12 @@
 
     const rect = activeInput.getBoundingClientRect();
     const viewportGap = 8;
+    const inputGap = 4;
+    const defaultMaxHeight = 280;
     const belowTop = rect.bottom + 4;
+    const aboveBottom = rect.top - inputGap;
+    const availableBelow = Math.max(0, window.innerHeight - belowTop - viewportGap);
+    const availableAbove = Math.max(0, aboveBottom - viewportGap);
     const maxWidth = window.innerWidth - viewportGap * 2;
     const width = Math.min(maxWidth, Math.max(rect.width, estimatePopupWidth()));
 
@@ -2679,12 +3015,16 @@
       window.innerWidth - popup.offsetWidth - viewportGap
     )}px`;
 
-    const popupHeight = popup.offsetHeight || 240;
-    const aboveTop = rect.top - popupHeight - 4;
-    const fitsBelow = belowTop + popupHeight < window.innerHeight - viewportGap;
-    popup.style.top = fitsBelow
+    const naturalHeight = Math.min(defaultMaxHeight, popup.scrollHeight || popup.offsetHeight || defaultMaxHeight);
+    const showBelow = availableBelow >= naturalHeight || availableBelow >= availableAbove;
+    const availableSpace = showBelow ? availableBelow : availableAbove;
+    const maxHeight = Math.max(32, Math.min(defaultMaxHeight, availableSpace || defaultMaxHeight));
+    popup.style.maxHeight = `${maxHeight}px`;
+
+    const popupHeight = Math.min(maxHeight, popup.offsetHeight || naturalHeight);
+    popup.style.top = showBelow
       ? `${belowTop}px`
-      : `${Math.max(viewportGap, aboveTop)}px`;
+      : `${Math.max(viewportGap, aboveBottom - popupHeight)}px`;
   }
 
   function estimatePopupWidth() {

@@ -1,5 +1,6 @@
 # Browser/test artifacts
 .playwright-mcp/
+__pycache__/
 
 # Local source data and editable document drafts
 *.csv
