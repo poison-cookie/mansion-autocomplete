@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Site Input Autocomplete
 // @namespace    local.site-input-autocomplete
-// @version      1.7.7
+// @version      1.7.9
 // @description  Add a custom autocomplete picker with site-specific candidates and usage counts.
 // @homepageURL   https://github.com/poison-cookie/mansion-autocomplete
 // @updateURL     https://raw.githubusercontent.com/poison-cookie/mansion-autocomplete/main/mansion-autocomplete.user.js
@@ -30,7 +30,8 @@
   const DISABLED_SITES_KEY = 'mansionAutocomplete.disabledSites.v1';
   const HISTORY_LIMIT_KEY = 'mansionAutocomplete.historyLimit.v1';
   const MANAGER_BUTTON_POSITION_KEY = 'mansionAutocomplete.managerButtonPosition.v1';
-  const SCRIPT_VERSION = '1.7.7';
+  const HIDDEN_MANAGER_BUTTON_SITES_KEY = 'mansionAutocomplete.hiddenManagerButtonSites.v1';
+  const SCRIPT_VERSION = '1.7.9';
   const MIGRATION_SCHEMA = 'site-input-autocomplete';
   const MIGRATION_VERSION = 1;
   const SYNC_STORAGE_KEYS = [
@@ -42,6 +43,7 @@
     DISABLED_SITES_KEY,
     HISTORY_LIMIT_KEY,
     MANAGER_BUTTON_POSITION_KEY,
+    HIDDEN_MANAGER_BUTTON_SITES_KEY,
   ];
   const MAX_RESULTS = 12;
   const DEFAULT_HISTORY_LIMIT_PER_SITE = 5000;
@@ -63,6 +65,7 @@
   let suppressNativeAutocomplete = loadSuppressNativeAutocomplete();
   let disabledSites = loadDisabledSites();
   let historyLimitPerSite = loadHistoryLimitPerSite();
+  let hiddenManagerButtonSites = loadHiddenManagerButtonSites();
   const recentRecords = new Map();
   const entryAttributeRestores = new WeakMap();
   let lastPopupCommit = { value: '', at: 0 };
@@ -581,15 +584,8 @@
   updateManagerButtonVisibility();
 
   if (typeof GM_registerMenuCommand === 'function') {
-    // Tampermonkey の拡張機能メニューからも主要操作を実行できるようにする。
+    // Tampermonkey側は復旧導線だけに絞り、詳細操作は設定画面へ集約する。
     GM_registerMenuCommand('設定画面を開く', openManager);
-    GM_registerMenuCommand('移行画面を開く', openMigration);
-    GM_registerMenuCommand('このサイトで有効/無効を切り替え', toggleSiteEnabled);
-    GM_registerMenuCommand('入力モードを切り替え', toggleInputMode);
-    GM_registerMenuCommand('Chrome候補抑制を切り替え', toggleSuppressNativeAutocomplete);
-    GM_registerMenuCommand('このサイトの候補を編集', editPhrases);
-    GM_registerMenuCommand('このサイトの候補を初期化', resetPhrases);
-    GM_registerMenuCommand('このサイトの使用回数をリセット', clearSiteHistory);
   }
 
   managerButton.addEventListener('pointerdown', startManagerButtonDrag);
@@ -650,6 +646,15 @@
   });
 
   document.addEventListener('keydown', (event) => {
+    if (isSettingsShortcut(event)) {
+      if (!isOwnUiEvent(event) && !isSiteDisabled()) {
+        event.preventDefault();
+        event.stopPropagation();
+        openManager();
+      }
+      return;
+    }
+
     if (isOwnUiEvent(event)) return;
     if (isSiteDisabled()) return;
     if (event.isComposing || isComposingText || !activeInput || popup.hidden) return;
@@ -880,6 +885,11 @@
     return Array.isArray(saved) ? saved.filter((item) => typeof item === 'string') : [];
   }
 
+  function loadHiddenManagerButtonSites() {
+    const saved = readValue(HIDDEN_MANAGER_BUTTON_SITES_KEY, []);
+    return Array.isArray(saved) ? saved.filter((item) => typeof item === 'string') : [];
+  }
+
   function loadHistoryLimitPerSite() {
     const saved = Number(readValue(HISTORY_LIMIT_KEY, DEFAULT_HISTORY_LIMIT_PER_SITE));
     return HISTORY_LIMIT_OPTIONS.includes(saved) ? saved : DEFAULT_HISTORY_LIMIT_PER_SITE;
@@ -905,6 +915,14 @@
 
   function isSiteDisabled() {
     return disabledSites.includes(siteKey);
+  }
+
+  function saveHiddenManagerButtonSites() {
+    writeValue(HIDDEN_MANAGER_BUTTON_SITES_KEY, [...new Set(hiddenManagerButtonSites)]);
+  }
+
+  function isManagerButtonHiddenForSite() {
+    return hiddenManagerButtonSites.includes(siteKey);
   }
 
   function saveHistory() {
@@ -1007,6 +1025,7 @@
     suppressNativeAutocomplete = loadSuppressNativeAutocomplete();
     disabledSites = loadDisabledSites();
     historyLimitPerSite = loadHistoryLimitPerSite();
+    hiddenManagerButtonSites = loadHiddenManagerButtonSites();
     managerButtonPosition = loadManagerButtonPosition();
     applyManagerButtonPosition();
     updateManagerButtonVisibility();
@@ -1096,6 +1115,12 @@
     window.alert(`${siteKey} での機能を「${isSiteDisabled() ? '無効' : '有効'}」にしました。`);
   }
 
+  function toggleManagerButtonForSite() {
+    syncStoredData();
+    setManagerButtonHiddenForSite(!isManagerButtonHiddenForSite());
+    window.alert(`${siteKey} の設定ボタンを「${isManagerButtonHiddenForSite() ? '非表示' : '表示'}」にしました。非表示でも Ctrl + . またはTampermonkeyメニューから設定画面を開けます。`);
+  }
+
   function setSiteDisabled(disabled) {
     disabledSites = loadDisabledSites();
     if (disabled) {
@@ -1109,6 +1134,17 @@
       }
     }
     saveDisabledSites();
+    updateManagerButtonVisibility();
+  }
+
+  function setManagerButtonHiddenForSite(hidden) {
+    hiddenManagerButtonSites = loadHiddenManagerButtonSites();
+    if (hidden) {
+      hiddenManagerButtonSites = [...new Set(hiddenManagerButtonSites.concat(siteKey))];
+    } else {
+      hiddenManagerButtonSites = hiddenManagerButtonSites.filter((item) => item !== siteKey);
+    }
+    saveHiddenManagerButtonSites();
     updateManagerButtonVisibility();
   }
 
@@ -1608,7 +1644,11 @@
   }
 
   function updateManagerButtonVisibility() {
-    managerButton.hidden = isSiteDisabled();
+    managerButton.hidden = isSiteDisabled() || isManagerButtonHiddenForSite();
+  }
+
+  function isSettingsShortcut(event) {
+    return event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey && event.key === '.';
   }
 
   function setManagerButtonPosition(left, top) {
@@ -1674,6 +1714,7 @@
     body.className = 'mac-manager-body';
 
     body.appendChild(createSiteEnabledSection());
+    body.appendChild(createManagerButtonSection());
     body.appendChild(createModeSection());
     body.appendChild(createSuppressSection());
     body.appendChild(createHistoryLimitSection());
@@ -2013,6 +2054,7 @@
       ...Object.keys(history || {}),
       ...Object.keys(pinned || {}),
       ...disabledSites,
+      ...hiddenManagerButtonSites,
     ]);
     keys.add(siteKey);
     return [...keys].filter(Boolean).sort((a, b) => a.localeCompare(b, 'ja'));
@@ -2177,6 +2219,7 @@
         suppressNativeAutocomplete,
         historyLimitPerSite,
         disabledSites: disabledSites.filter((site) => selected.has(site)),
+        hiddenManagerButtonSites: hiddenManagerButtonSites.filter((site) => selected.has(site)),
       };
     }
 
@@ -2315,6 +2358,10 @@
       disabledSites = uniqueNonEmpty(loadDisabledSites().concat(settings.disabledSites));
       writeValue(DISABLED_SITES_KEY, disabledSites);
     }
+    if (Array.isArray(settings.hiddenManagerButtonSites)) {
+      hiddenManagerButtonSites = uniqueNonEmpty(loadHiddenManagerButtonSites().concat(settings.hiddenManagerButtonSites));
+      writeValue(HIDDEN_MANAGER_BUTTON_SITES_KEY, hiddenManagerButtonSites);
+    }
   }
 
   function sanitizeHistoryMap(rawHistory) {
@@ -2359,6 +2406,31 @@
     button.textContent = isSiteDisabled() ? '有効にする' : '無効にする';
     button.addEventListener('click', () => {
       setSiteDisabled(!isSiteDisabled());
+      renderManager();
+    });
+
+    box.appendChild(text);
+    box.appendChild(button);
+    section.appendChild(box);
+    return section;
+  }
+
+  function createManagerButtonSection() {
+    const section = document.createElement('section');
+    const box = document.createElement('div');
+    box.className = 'mac-mode';
+
+    const text = document.createElement('div');
+    text.className = 'mac-mode-text';
+    text.textContent = `設定ボタン: ${isManagerButtonHiddenForSite() ? '非表示' : '表示'} (${siteKey})`;
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = isManagerButtonHiddenForSite() ? 'mac-primary' : '';
+    button.textContent = isManagerButtonHiddenForSite() ? '表示する' : '非表示にする';
+    button.title = '非表示でも Ctrl + . またはTampermonkeyメニューから設定画面を開けます。';
+    button.addEventListener('click', () => {
+      setManagerButtonHiddenForSite(!isManagerButtonHiddenForSite());
       renderManager();
     });
 
