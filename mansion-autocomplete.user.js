@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Site Input Autocomplete
 // @namespace    local.site-input-autocomplete
-// @version      1.7.9
+// @version      1.8.1
 // @description  Add a custom autocomplete picker with site-specific candidates and usage counts.
 // @homepageURL   https://github.com/poison-cookie/mansion-autocomplete
 // @updateURL     https://raw.githubusercontent.com/poison-cookie/mansion-autocomplete/main/mansion-autocomplete.user.js
@@ -31,7 +31,8 @@
   const HISTORY_LIMIT_KEY = 'mansionAutocomplete.historyLimit.v1';
   const MANAGER_BUTTON_POSITION_KEY = 'mansionAutocomplete.managerButtonPosition.v1';
   const HIDDEN_MANAGER_BUTTON_SITES_KEY = 'mansionAutocomplete.hiddenManagerButtonSites.v1';
-  const SCRIPT_VERSION = '1.7.9';
+  const SITE_SCOPES_KEY = 'mansionAutocomplete.siteScopes.v1';
+  const SCRIPT_VERSION = '1.8.1';
   const MIGRATION_SCHEMA = 'site-input-autocomplete';
   const MIGRATION_VERSION = 1;
   const SYNC_STORAGE_KEYS = [
@@ -44,6 +45,7 @@
     HISTORY_LIMIT_KEY,
     MANAGER_BUTTON_POSITION_KEY,
     HIDDEN_MANAGER_BUTTON_SITES_KEY,
+    SITE_SCOPES_KEY,
   ];
   const MAX_RESULTS = 12;
   const DEFAULT_HISTORY_LIMIT_PER_SITE = 5000;
@@ -66,8 +68,10 @@
   let disabledSites = loadDisabledSites();
   let historyLimitPerSite = loadHistoryLimitPerSite();
   let hiddenManagerButtonSites = loadHiddenManagerButtonSites();
+  let siteScopes = loadSiteScopes();
   const recentRecords = new Map();
   const entryAttributeRestores = new WeakMap();
+  let lastFocusedTextEntry = null;
   let lastPopupCommit = { value: '', at: 0 };
   let lastCopyCommit = { value: '', at: 0 };
   let copiedMessage = '';
@@ -89,6 +93,8 @@
   let migrationPendingImport = null;
   let managerButtonPosition = loadManagerButtonPosition();
   let managerButtonDrag = null;
+  let siteScopeMessage = '';
+  let managerFieldPickerOpen = false;
 
   const uiHost = document.createElement('div');
   uiHost.id = 'mansion-autocomplete-ui-host';
@@ -384,6 +390,53 @@
       font-size: 13px;
       color: #334155;
     }
+    #mansion-autocomplete-manager .mac-scope-block {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+      border: 1px solid #dbe3ef;
+      border-radius: 6px;
+      background: #f8fafc;
+    }
+    #mansion-autocomplete-manager .mac-scope-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 0;
+    }
+    #mansion-autocomplete-manager .mac-scope-title {
+      min-width: 0;
+      color: #334155;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    #mansion-autocomplete-manager .mac-rule-list {
+      display: grid;
+      gap: 6px;
+    }
+    #mansion-autocomplete-manager .mac-rule-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      padding: 8px 10px;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      background: #fff;
+    }
+    #mansion-autocomplete-manager .mac-rule-name {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      color: #111827;
+      font-size: 13px;
+    }
+    #mansion-autocomplete-manager .mac-rule-meta {
+      margin-top: 2px;
+      color: #64748b;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
     #mansion-autocomplete-manager .mac-manager-row {
       display: flex;
       gap: 8px;
@@ -607,11 +660,17 @@
 
   // 入力欄にフォーカスしたら候補ポップアップを表示する。
   document.addEventListener('focusin', (event) => {
-    if (isSiteDisabled()) return;
     if (isTextEntry(event.target)) {
+      lastFocusedTextEntry = event.target;
+    }
+    if (isSiteDisabled()) return;
+    if (isAutocompleteTarget(event.target)) {
       activeInput = event.target;
       applyNativeAutocompleteSuppression(activeInput);
       updatePopup();
+    } else if (isTextEntry(event.target)) {
+      activeInput = null;
+      hidePopup();
     }
   });
 
@@ -623,7 +682,7 @@
 
   document.addEventListener('input', (event) => {
     if (isSiteDisabled()) return;
-    if (event.target === activeInput) {
+    if (event.target === activeInput && isAutocompleteTarget(event.target)) {
       if (isComposingText || event.isComposing) return;
       updatePopup();
     }
@@ -631,7 +690,7 @@
 
   document.addEventListener('compositionstart', (event) => {
     if (isSiteDisabled()) return;
-    if (event.target === activeInput) {
+    if (event.target === activeInput && isAutocompleteTarget(event.target)) {
       isComposingText = true;
       hidePopup();
     }
@@ -639,7 +698,7 @@
 
   document.addEventListener('compositionend', (event) => {
     if (isSiteDisabled()) return;
-    if (event.target === activeInput) {
+    if (event.target === activeInput && isAutocompleteTarget(event.target)) {
       isComposingText = false;
       updatePopup();
     }
@@ -890,6 +949,88 @@
     return Array.isArray(saved) ? saved.filter((item) => typeof item === 'string') : [];
   }
 
+  function loadSiteScopes() {
+    const saved = readValue(SITE_SCOPES_KEY, {});
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return {};
+
+    const result = {};
+    Object.entries(saved).forEach(([site, scope]) => {
+      const cleanSite = String(site || '').trim();
+      if (!cleanSite) return;
+      const cleanScope = sanitizeSiteScope(scope);
+      if (cleanScope.enabledPaths.length || cleanScope.fieldSelectors.length) {
+        result[cleanSite] = cleanScope;
+      }
+    });
+    return result;
+  }
+
+  function getCurrentSiteScope() {
+    return sanitizeSiteScope(siteScopes[siteKey]);
+  }
+
+  function writeCurrentSiteScope(scope) {
+    const nextScopes = loadSiteScopes();
+    const cleanScope = sanitizeSiteScope(scope);
+    if (cleanScope.enabledPaths.length || cleanScope.fieldSelectors.length) {
+      nextScopes[siteKey] = cleanScope;
+    } else {
+      delete nextScopes[siteKey];
+    }
+    siteScopes = nextScopes;
+    writeValue(SITE_SCOPES_KEY, siteScopes);
+  }
+
+  function sanitizeSiteScope(scope) {
+    const result = {
+      enabledPaths: [],
+      fieldSelectors: [],
+    };
+    if (!scope || typeof scope !== 'object' || Array.isArray(scope)) return result;
+
+    const seenPaths = new Set();
+    if (Array.isArray(scope.enabledPaths)) {
+      scope.enabledPaths.forEach((rule) => {
+        const cleanRule = sanitizePathRule(rule);
+        if (!cleanRule) return;
+        const key = `${cleanRule.type}\n${cleanRule.value}`;
+        if (seenPaths.has(key)) return;
+        seenPaths.add(key);
+        result.enabledPaths.push(cleanRule);
+      });
+    }
+
+    const seenFields = new Set();
+    if (Array.isArray(scope.fieldSelectors)) {
+      scope.fieldSelectors.forEach((field) => {
+        const cleanField = sanitizeFieldSelector(field);
+        if (!cleanField) return;
+        if (seenFields.has(cleanField.selector)) return;
+        seenFields.add(cleanField.selector);
+        result.fieldSelectors.push(cleanField);
+      });
+    }
+
+    return result;
+  }
+
+  function sanitizePathRule(rule) {
+    if (!rule || typeof rule !== 'object' || Array.isArray(rule)) return null;
+    const type = rule.type === 'prefix' ? 'prefix' : 'exact';
+    const value = normalizePagePath(rule.value);
+    if (!value) return null;
+    return { type, value };
+  }
+
+  function sanitizeFieldSelector(field) {
+    if (!field || typeof field !== 'object' || Array.isArray(field)) return null;
+    const selector = String(field.selector || '').trim();
+    if (!selector || !isValidSelector(selector)) return null;
+    const label = String(field.label || '').trim() || selector;
+    const source = String(field.source || '').trim() || 'selector';
+    return { selector, label, source };
+  }
+
   function loadHistoryLimitPerSite() {
     const saved = Number(readValue(HISTORY_LIMIT_KEY, DEFAULT_HISTORY_LIMIT_PER_SITE));
     return HISTORY_LIMIT_OPTIONS.includes(saved) ? saved : DEFAULT_HISTORY_LIMIT_PER_SITE;
@@ -1026,6 +1167,7 @@
     disabledSites = loadDisabledSites();
     historyLimitPerSite = loadHistoryLimitPerSite();
     hiddenManagerButtonSites = loadHiddenManagerButtonSites();
+    siteScopes = loadSiteScopes();
     managerButtonPosition = loadManagerButtonPosition();
     applyManagerButtonPosition();
     updateManagerButtonVisibility();
@@ -1040,9 +1182,13 @@
     if (isSiteDisabled()) {
       hidePopup();
       if (activeInput) restoreEntryAttributes(activeInput);
-    } else if (!managerOpen && activeInput && isTextEntry(activeInput)) {
+    } else if (!managerOpen && activeInput && isAutocompleteTarget(activeInput)) {
       applyNativeAutocompleteSuppression(activeInput);
       updatePopup();
+    } else if (!managerOpen && activeInput) {
+      restoreEntryAttributes(activeInput);
+      activeInput = null;
+      hidePopup();
     }
 
     const focusedInManager = uiRoot.activeElement && manager.contains(uiRoot.activeElement);
@@ -1190,8 +1336,56 @@
     ].includes(element.type);
   }
 
+  function isAutocompleteTarget(element) {
+    if (!isTextEntry(element)) return false;
+    if (isFloatingPropertySearchInput(element)) return true;
+    return isPageAllowed() && isFieldAllowed(element);
+  }
+
+  function isPageAllowed() {
+    const rules = getCurrentSiteScope().enabledPaths;
+    if (!rules.length) return true;
+    const currentPath = getCurrentPagePath();
+    return rules.some((rule) => {
+      if (rule.type === 'prefix') return currentPath.startsWith(rule.value);
+      return currentPath === rule.value;
+    });
+  }
+
+  function isFieldAllowed(element) {
+    const fields = getCurrentSiteScope().fieldSelectors;
+    if (!fields.length) return true;
+    if (isFloatingPropertySearchInput(element)) return true;
+    return fields.some((field) => matchesFieldSelector(element, field.selector));
+  }
+
+  function isFloatingPropertySearchInput(element) {
+    return Boolean(
+      element instanceof HTMLInputElement &&
+      element.classList.contains('fps-floating-input') &&
+      element.closest('#fps-floating-form')
+    );
+  }
+
+  function matchesFieldSelector(element, selector) {
+    try {
+      return Boolean(element && typeof element.matches === 'function' && element.matches(selector));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function isValidSelector(selector) {
+    try {
+      document.querySelector(selector);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   function updatePopup() {
-    if (!activeInput || !isTextEntry(activeInput)) {
+    if (!activeInput || !isAutocompleteTarget(activeInput)) {
       hidePopup();
       return;
     }
@@ -1715,6 +1909,7 @@
 
     body.appendChild(createSiteEnabledSection());
     body.appendChild(createManagerButtonSection());
+    body.appendChild(createScopeSection());
     body.appendChild(createModeSection());
     body.appendChild(createSuppressSection());
     body.appendChild(createHistoryLimitSection());
@@ -2041,7 +2236,7 @@
     const summary = getMigrationSiteSummary(site);
     const text = document.createElement('span');
     text.className = 'mac-check-text';
-    text.textContent = `${site} / 候補 ${summary.candidates.toLocaleString('ja-JP')}件 / ピン ${summary.pinned.toLocaleString('ja-JP')}件 / 履歴 ${summary.history.toLocaleString('ja-JP')}件`;
+    text.textContent = `${site} / 候補 ${summary.candidates.toLocaleString('ja-JP')}件 / ピン ${summary.pinned.toLocaleString('ja-JP')}件 / 履歴 ${summary.history.toLocaleString('ja-JP')}件 / 表示条件 ${summary.scopes.toLocaleString('ja-JP')}件`;
 
     label.appendChild(input);
     label.appendChild(text);
@@ -2053,6 +2248,7 @@
       ...Object.keys(sitePhrases || {}),
       ...Object.keys(history || {}),
       ...Object.keys(pinned || {}),
+      ...Object.keys(siteScopes || {}),
       ...disabledSites,
       ...hiddenManagerButtonSites,
     ]);
@@ -2066,10 +2262,12 @@
   }
 
   function getMigrationSiteSummary(site) {
+    const scope = getSiteScope(site);
     return {
       candidates: getSitePhrases(site).length,
       pinned: getSitePinned(site).length,
       history: Object.keys(getSiteHistory(site)).length,
+      scopes: countSiteScopeRules(scope),
     };
   }
 
@@ -2088,6 +2286,15 @@
     return current && typeof current === 'object' && !Array.isArray(current) ? current : {};
   }
 
+  function getSiteScope(site) {
+    return sanitizeSiteScope(siteScopes && siteScopes[site]);
+  }
+
+  function countSiteScopeRules(scope) {
+    const cleanScope = sanitizeSiteScope(scope);
+    return cleanScope.enabledPaths.length + cleanScope.fieldSelectors.length;
+  }
+
   function buildExportPreviewLines() {
     const selectedSites = getSelectedMigrationSites();
     const summary = selectedSites.reduce((total, site) => {
@@ -2100,14 +2307,16 @@
       total.candidates += candidates.length;
       total.pinned += migrationIncludePinned ? getSitePinned(site).length : 0;
       total.history += Object.keys(historyEntries).length;
+      total.scopes += migrationIncludeSettings ? countSiteScopeRules(getSiteScope(site)) : 0;
       return total;
-    }, { candidates: 0, pinned: 0, history: 0 });
+    }, { candidates: 0, pinned: 0, history: 0, scopes: 0 });
 
     return [
       `対象サイト: ${selectedSites.length.toLocaleString('ja-JP')}件`,
       `候補名: ${summary.candidates.toLocaleString('ja-JP')}件`,
       `ピン止め: ${migrationIncludePinned ? `${summary.pinned.toLocaleString('ja-JP')}件を含める` : '含めない'}`,
       `使用履歴: ${migrationIncludeHistory ? `${summary.history.toLocaleString('ja-JP')}件を含める` : '含めない'}`,
+      `表示条件: ${migrationIncludeSettings ? `${summary.scopes.toLocaleString('ja-JP')}件を含める` : '含めない'}`,
       `基本設定: ${migrationIncludeSettings ? '含める' : '含めない'}`,
       `出力サイト: ${formatSiteList(selectedSites)}`,
     ];
@@ -2118,36 +2327,48 @@
       throw new Error('このツール用のJSONではありません。');
     }
 
-    const siteEntries = Object.entries(payload.sites)
-      .map(([site, rawSiteData]) => {
-        const cleanSite = String(site || '').trim();
-        if (!cleanSite || !rawSiteData || typeof rawSiteData !== 'object' || Array.isArray(rawSiteData)) return null;
+    const importedScopes = migrationImportIncludeSettings && payload.settings
+      ? sanitizeSiteScopesMap(payload.settings.siteScopes)
+      : {};
+    const targetSites = uniqueNonEmpty([
+      ...Object.keys(payload.sites),
+      ...Object.keys(importedScopes),
+    ]);
 
-        const importedPinned = migrationImportIncludePinned ? uniqueNonEmpty(rawSiteData.pinned || []) : [];
-        const importedHistory = migrationImportIncludeHistory ? sanitizeHistoryMap(rawSiteData.history || {}) : {};
-        const importedCandidates = uniqueNonEmpty([
-          ...(Array.isArray(rawSiteData.candidates) ? rawSiteData.candidates : []),
-          ...(Array.isArray(rawSiteData.phrases) ? rawSiteData.phrases : []),
-          ...importedPinned,
-          ...Object.keys(importedHistory),
-        ]);
+    const siteEntries = targetSites.map((site) => {
+      const rawSiteData = payload.sites[site];
+      const cleanSite = String(site || '').trim();
+      const siteData = rawSiteData && typeof rawSiteData === 'object' && !Array.isArray(rawSiteData)
+        ? rawSiteData
+        : {};
 
-        return {
-          site: cleanSite,
-          candidates: importedCandidates.length,
-          pinned: importedPinned.length,
-          history: Object.keys(importedHistory).length,
-        };
-      })
-      .filter(Boolean)
-      .filter((entry) => entry.candidates || entry.pinned || entry.history);
+      const importedPinned = migrationImportIncludePinned ? uniqueNonEmpty(siteData.pinned || []) : [];
+      const importedHistory = migrationImportIncludeHistory ? sanitizeHistoryMap(siteData.history || {}) : {};
+      const importedCandidates = uniqueNonEmpty([
+        ...(Array.isArray(siteData.candidates) ? siteData.candidates : []),
+        ...(Array.isArray(siteData.phrases) ? siteData.phrases : []),
+        ...importedPinned,
+        ...Object.keys(importedHistory),
+      ]);
+      const importedScopeCount = countSiteScopeRules(importedScopes[cleanSite]);
+
+      return {
+        site: cleanSite,
+        candidates: importedCandidates.length,
+        pinned: importedPinned.length,
+        history: Object.keys(importedHistory).length,
+        scopes: importedScopeCount,
+      };
+    })
+      .filter((entry) => entry.site && (entry.candidates || entry.pinned || entry.history || entry.scopes));
 
     const totals = siteEntries.reduce((sum, entry) => {
       sum.candidates += entry.candidates;
       sum.pinned += entry.pinned;
       sum.history += entry.history;
+      sum.scopes += entry.scopes;
       return sum;
-    }, { candidates: 0, pinned: 0, history: 0 });
+    }, { candidates: 0, pinned: 0, history: 0, scopes: 0 });
 
     return {
       siteEntries,
@@ -2156,6 +2377,7 @@
         `候補名: ${totals.candidates.toLocaleString('ja-JP')}件をマージ`,
         `ピン止め: ${migrationImportIncludePinned ? `${totals.pinned.toLocaleString('ja-JP')}件を取り込む` : '取り込まない'}`,
         `使用履歴: ${migrationImportIncludeHistory ? `${totals.history.toLocaleString('ja-JP')}件を取り込む` : '取り込まない'}`,
+        `表示条件: ${migrationImportIncludeSettings && payload.settings ? `${totals.scopes.toLocaleString('ja-JP')}件を取り込む` : '取り込まない'}`,
         `基本設定: ${migrationImportIncludeSettings && payload.settings ? '取り込む' : '取り込まない'}`,
         `対象サイト: ${formatSiteList(siteEntries.map((entry) => entry.site))}`,
       ],
@@ -2214,6 +2436,13 @@
 
     if (migrationIncludeSettings) {
       const selected = new Set(selectedSites);
+      const selectedSiteScopes = {};
+      selectedSites.forEach((site) => {
+        const scope = getSiteScope(site);
+        if (countSiteScopeRules(scope)) {
+          selectedSiteScopes[site] = scope;
+        }
+      });
       payload.settings = {
         inputMode,
         suppressNativeAutocomplete,
@@ -2221,6 +2450,9 @@
         disabledSites: disabledSites.filter((site) => selected.has(site)),
         hiddenManagerButtonSites: hiddenManagerButtonSites.filter((site) => selected.has(site)),
       };
+      if (Object.keys(selectedSiteScopes).length) {
+        payload.settings.siteScopes = selectedSiteScopes;
+      }
     }
 
     return payload;
@@ -2260,7 +2492,7 @@
       const result = applyMigrationPayload(migrationPendingImport.payload);
       migrationPendingImport = null;
       syncStoredData();
-      migrationMessage = `JSONインポート完了: ${result.sites.toLocaleString('ja-JP')}サイト / 候補 ${result.candidates.toLocaleString('ja-JP')}件 / ピン ${result.pinned.toLocaleString('ja-JP')}件 / 履歴 ${result.history.toLocaleString('ja-JP')}件`;
+      migrationMessage = `JSONインポート完了: ${result.sites.toLocaleString('ja-JP')}サイト / 候補 ${result.candidates.toLocaleString('ja-JP')}件 / ピン ${result.pinned.toLocaleString('ja-JP')}件 / 履歴 ${result.history.toLocaleString('ja-JP')}件 / 表示条件 ${result.scopes.toLocaleString('ja-JP')}件`;
       window.alert(migrationMessage);
       hidePopup();
       renderMigration();
@@ -2279,7 +2511,8 @@
     const nextPhrases = loadSitePhrases();
     const nextPinned = loadPinned();
     const nextHistory = loadHistory();
-    const result = { sites: 0, candidates: 0, pinned: 0, history: 0 };
+    const result = { sites: 0, candidates: 0, pinned: 0, history: 0, scopes: 0 };
+    const touchedSites = new Set();
 
     Object.entries(payload.sites).forEach(([site, rawSiteData]) => {
       const cleanSite = String(site || '').trim();
@@ -2295,7 +2528,7 @@
       ]);
 
       if (!importedCandidates.length && !importedPinned.length && !Object.keys(importedHistory).length) return;
-      result.sites += 1;
+      touchedSites.add(cleanSite);
 
       const currentPhrases = Array.isArray(nextPhrases[cleanSite]) ? uniqueNonEmpty(nextPhrases[cleanSite]) : [];
       const mergedPhrases = uniqueNonEmpty(currentPhrases.concat(importedCandidates));
@@ -2335,13 +2568,17 @@
     writeValue(HISTORY_KEY, history);
 
     if (migrationImportIncludeSettings && payload.settings && typeof payload.settings === 'object') {
-      applyMigrationSettings(payload.settings);
+      const settingsResult = applyMigrationSettings(payload.settings);
+      settingsResult.sites.forEach((site) => touchedSites.add(site));
+      result.scopes += settingsResult.scopes;
     }
 
+    result.sites = touchedSites.size;
     return result;
   }
 
   function applyMigrationSettings(settings) {
+    const result = { sites: [], scopes: 0 };
     if (settings.inputMode === 'setter' || settings.inputMode === 'typing') {
       inputMode = settings.inputMode;
       writeValue(INPUT_MODE_KEY, inputMode);
@@ -2362,6 +2599,54 @@
       hiddenManagerButtonSites = uniqueNonEmpty(loadHiddenManagerButtonSites().concat(settings.hiddenManagerButtonSites));
       writeValue(HIDDEN_MANAGER_BUTTON_SITES_KEY, hiddenManagerButtonSites);
     }
+    const importedScopes = sanitizeSiteScopesMap(settings.siteScopes);
+    if (Object.keys(importedScopes).length) {
+      const merged = mergeSiteScopes(loadSiteScopes(), importedScopes);
+      siteScopes = merged.scopes;
+      result.scopes = merged.addedRules;
+      result.sites = Object.keys(importedScopes);
+      writeValue(SITE_SCOPES_KEY, siteScopes);
+    }
+    return result;
+  }
+
+  function sanitizeSiteScopesMap(rawScopes) {
+    const result = {};
+    if (!rawScopes || typeof rawScopes !== 'object' || Array.isArray(rawScopes)) return result;
+
+    Object.entries(rawScopes).forEach(([site, scope]) => {
+      const cleanSite = String(site || '').trim();
+      if (!cleanSite) return;
+      const cleanScope = sanitizeSiteScope(scope);
+      if (countSiteScopeRules(cleanScope)) {
+        result[cleanSite] = cleanScope;
+      }
+    });
+
+    return result;
+  }
+
+  function mergeSiteScopes(currentScopes, importedScopes) {
+    const nextScopes = sanitizeSiteScopesMap(currentScopes);
+    let addedRules = 0;
+
+    Object.entries(importedScopes).forEach(([site, scope]) => {
+      const current = sanitizeSiteScope(nextScopes[site]);
+      const before = countSiteScopeRules(current);
+      const merged = sanitizeSiteScope({
+        enabledPaths: current.enabledPaths.concat(scope.enabledPaths),
+        fieldSelectors: current.fieldSelectors.concat(scope.fieldSelectors),
+      });
+
+      if (countSiteScopeRules(merged)) {
+        nextScopes[site] = merged;
+      } else {
+        delete nextScopes[site];
+      }
+      addedRules += Math.max(0, countSiteScopeRules(merged) - before);
+    });
+
+    return { scopes: nextScopes, addedRules };
   }
 
   function sanitizeHistoryMap(rawHistory) {
@@ -2389,6 +2674,242 @@
 
   function formatDateForFilename() {
     return new Date().toISOString().slice(0, 10).replaceAll('-', '');
+  }
+
+  function getCurrentPagePath() {
+    const path = location.pathname || '/';
+    const hash = location.hash || '';
+    if (hash.startsWith('#/') || hash.startsWith('#!')) {
+      return `${path}${hash}`;
+    }
+    return path;
+  }
+
+  function getCurrentDirectoryPath() {
+    const path = getCurrentPagePath();
+    if (!path || path === '/' || path.endsWith('/')) return path || '/';
+    const index = path.lastIndexOf('/');
+    return index <= 0 ? `${path}/` : path.slice(0, index + 1);
+  }
+
+  function normalizePagePath(value) {
+    let text = String(value || '').trim();
+    if (!text) return '';
+
+    if (/^https?:\/\//i.test(text)) {
+      try {
+        const url = new URL(text);
+        text = `${url.pathname || '/'}${url.hash && (url.hash.startsWith('#/') || url.hash.startsWith('#!')) ? url.hash : ''}`;
+      } catch (_) {
+        return '';
+      }
+    }
+
+    if (text.startsWith('#/') || text.startsWith('#!')) {
+      text = `/${text}`;
+    } else if (!text.startsWith('/')) {
+      text = `/${text}`;
+    }
+
+    return text;
+  }
+
+  function addCurrentPathRule(type, value) {
+    const scope = getCurrentSiteScope();
+    const rule = sanitizePathRule({ type, value });
+    if (!rule) return;
+
+    const exists = scope.enabledPaths.some((item) => item.type === rule.type && item.value === rule.value);
+    if (!exists) {
+      writeCurrentSiteScope({
+        ...scope,
+        enabledPaths: scope.enabledPaths.concat(rule),
+      });
+    }
+    siteScopeMessage = exists ? 'このページ条件はすでに追加済みです。' : 'ページ条件を追加しました。';
+    renderManager();
+  }
+
+  function canUseLastFocusedTextEntry() {
+    return Boolean(lastFocusedTextEntry && document.documentElement.contains(lastFocusedTextEntry) && isTextEntry(lastFocusedTextEntry));
+  }
+
+  function addFieldSelectorForElement(element) {
+    if (!element || !isTextEntry(element)) {
+      siteScopeMessage = '追加できる入力欄が見つかりませんでした。先に対象の入力欄をクリックしてください。';
+      renderManager();
+      return;
+    }
+    addFieldSelector(buildFieldSelectorForElement(element));
+  }
+
+  function addFieldSelector(field) {
+    const scope = getCurrentSiteScope();
+    const cleanField = sanitizeFieldSelector(field);
+    if (!cleanField) {
+      siteScopeMessage = '入力欄条件を追加できませんでした。';
+      renderManager();
+      return;
+    }
+
+    const exists = scope.fieldSelectors.some((item) => item.selector === cleanField.selector);
+    if (!exists) {
+      writeCurrentSiteScope({
+        ...scope,
+        fieldSelectors: scope.fieldSelectors.concat(cleanField),
+      });
+    }
+    siteScopeMessage = exists ? 'この入力欄条件はすでに追加済みです。' : '入力欄条件を追加しました。';
+    renderManagerPreservingScroll();
+  }
+
+  function collectPageTextEntries() {
+    const entries = Array.from(document.querySelectorAll('input, textarea, [contenteditable]'))
+      .filter((element) => isTextEntry(element));
+    const visibleEntries = entries.filter(isVisibleTextEntry);
+    return (visibleEntries.length ? visibleEntries : entries).slice(0, 30);
+  }
+
+  function isVisibleTextEntry(element) {
+    const rect = element.getBoundingClientRect();
+    if (!rect.width && !rect.height) return false;
+    const style = window.getComputedStyle(element);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+  }
+
+  function buildFieldSelectorForElement(element) {
+    const label = getFieldLabel(element);
+    const candidates = buildFieldSelectorCandidates(element);
+    const selector = candidates.find((candidate) => selectorMatchesSingleTextEntry(candidate, element)) ||
+      candidates.find((candidate) => matchesFieldSelector(element, candidate)) ||
+      buildElementPathSelector(element);
+
+    return {
+      selector,
+      label,
+      source: 'auto',
+    };
+  }
+
+  function buildFieldSelectorCandidates(element) {
+    const base = getElementBaseSelector(element);
+    const candidates = [];
+    if (isFloatingPropertySearchInput(element)) {
+      candidates.push('#fps-floating-form .fps-floating-input');
+      candidates.push('input.fps-floating-input');
+    }
+    const attrNames = ['id', 'name', 'aria-label', 'placeholder', 'title'];
+
+    attrNames.forEach((attr) => {
+      const value = element.getAttribute(attr);
+      if (!value) return;
+      candidates.push(`${base}[${attr}="${escapeCssString(value)}"]`);
+      candidates.push(`[${attr}="${escapeCssString(value)}"]`);
+    });
+
+    if (element instanceof HTMLInputElement && element.getAttribute('type')) {
+      const typeBase = `input[type="${escapeCssString(element.getAttribute('type'))}"]`;
+      ['name', 'placeholder', 'aria-label'].forEach((attr) => {
+        const value = element.getAttribute(attr);
+        if (value) candidates.push(`${typeBase}[${attr}="${escapeCssString(value)}"]`);
+      });
+    }
+
+    if (element instanceof HTMLElement && element.hasAttribute('contenteditable')) {
+      candidates.push(`${element.tagName.toLowerCase()}[contenteditable]`);
+    }
+
+    return uniqueStrings(candidates).filter(isValidSelector);
+  }
+
+  function getElementBaseSelector(element) {
+    if (element instanceof HTMLInputElement) return 'input';
+    if (element instanceof HTMLTextAreaElement) return 'textarea';
+    if (element instanceof HTMLElement) return element.tagName.toLowerCase();
+    return '*';
+  }
+
+  function selectorMatchesSingleTextEntry(selector, element) {
+    return matchesFieldSelector(element, selector) && selectorTextEntryCount(selector) === 1;
+  }
+
+  function selectorTextEntryCount(selector) {
+    try {
+      return Array.from(document.querySelectorAll(selector)).filter((element) => isTextEntry(element)).length;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function getFieldLabel(element) {
+    if (isFloatingPropertySearchInput(element)) return 'フローティング検索フォーム';
+    const labelText = getAssociatedLabelText(element);
+    const candidates = [
+      element.getAttribute('aria-label'),
+      element.getAttribute('placeholder'),
+      labelText,
+      element.getAttribute('name'),
+      element.getAttribute('id'),
+      element.getAttribute('title'),
+    ].map((item) => String(item || '').trim()).filter(Boolean);
+
+    if (candidates.length) return candidates[0];
+    if (element instanceof HTMLTextAreaElement) return 'テキストエリア';
+    if (element instanceof HTMLElement && element.isContentEditable) return '編集可能エリア';
+    return '入力欄';
+  }
+
+  function getAssociatedLabelText(element) {
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+      if (element.labels && element.labels.length) {
+        return Array.from(element.labels).map((label) => label.textContent || '').join(' ').trim();
+      }
+    }
+    const parentLabel = element.closest && element.closest('label');
+    return parentLabel ? String(parentLabel.textContent || '').trim() : '';
+  }
+
+  function buildElementPathSelector(element) {
+    const parts = [];
+    let current = element;
+    while (current && current.nodeType === Node.ELEMENT_NODE && current !== document.documentElement && parts.length < 6) {
+      const tag = current.tagName.toLowerCase();
+      const id = current.getAttribute('id');
+      if (id) {
+        parts.unshift(`${tag}[id="${escapeCssString(id)}"]`);
+        break;
+      }
+
+      let index = 1;
+      let sibling = current.previousElementSibling;
+      while (sibling) {
+        if (sibling.tagName === current.tagName) index += 1;
+        sibling = sibling.previousElementSibling;
+      }
+      parts.unshift(`${tag}:nth-of-type(${index})`);
+      current = current.parentElement;
+    }
+
+    return parts.join(' > ') || getElementBaseSelector(element);
+  }
+
+  function escapeCssString(value) {
+    return String(value || '')
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/\r?\n/g, '\\A ');
+  }
+
+  function uniqueStrings(items) {
+    const result = [];
+    const seen = new Set();
+    items.forEach((item) => {
+      const value = String(item || '').trim();
+      if (!value || seen.has(value)) return;
+      seen.add(value);
+      result.push(value);
+    });
+    return result;
   }
 
   function createSiteEnabledSection() {
@@ -2438,6 +2959,248 @@
     box.appendChild(button);
     section.appendChild(box);
     return section;
+  }
+
+  function createScopeSection() {
+    const scope = getCurrentSiteScope();
+    const section = document.createElement('section');
+
+    const heading = document.createElement('h3');
+    heading.textContent = '表示条件';
+
+    const note = document.createElement('div');
+    note.className = 'mac-empty';
+    note.textContent = '未指定の場合は、これまで通り全ページ・全入力欄で候補を表示します。';
+
+    section.appendChild(heading);
+    section.appendChild(note);
+    if (siteScopeMessage) {
+      const status = document.createElement('div');
+      status.className = 'mac-status';
+      status.textContent = siteScopeMessage;
+      section.appendChild(status);
+    }
+    section.appendChild(createPageScopeBlock(scope));
+    section.appendChild(createFieldScopeBlock(scope));
+    return section;
+  }
+
+  function createPageScopeBlock(scope) {
+    const block = document.createElement('div');
+    block.className = 'mac-scope-block';
+
+    const head = document.createElement('div');
+    head.className = 'mac-scope-head';
+
+    const title = document.createElement('div');
+    title.className = 'mac-scope-title';
+    title.textContent = `対象ページ: ${scope.enabledPaths.length ? `${scope.enabledPaths.length.toLocaleString('ja-JP')}件指定` : '全ページ'}`;
+
+    const clearButton = document.createElement('button');
+    clearButton.type = 'button';
+    clearButton.className = 'mac-danger';
+    clearButton.textContent = 'ページ指定をクリア';
+    clearButton.disabled = !scope.enabledPaths.length;
+    clearButton.addEventListener('click', () => {
+      writeCurrentSiteScope({ ...scope, enabledPaths: [] });
+      siteScopeMessage = 'ページ指定をクリアしました。';
+      renderManager();
+    });
+
+    head.appendChild(title);
+    head.appendChild(clearButton);
+
+    const actions = document.createElement('div');
+    actions.className = 'mac-manager-row';
+
+    const currentPageButton = document.createElement('button');
+    currentPageButton.type = 'button';
+    currentPageButton.textContent = '現在のページを追加';
+    currentPageButton.addEventListener('click', () => {
+      addCurrentPathRule('exact', getCurrentPagePath());
+    });
+
+    const directoryButton = document.createElement('button');
+    directoryButton.type = 'button';
+    directoryButton.textContent = 'この階層以下を追加';
+    directoryButton.addEventListener('click', () => {
+      addCurrentPathRule('prefix', getCurrentDirectoryPath());
+    });
+
+    actions.appendChild(currentPageButton);
+    actions.appendChild(directoryButton);
+
+    const list = document.createElement('div');
+    list.className = 'mac-rule-list';
+    if (!scope.enabledPaths.length) {
+      list.appendChild(emptyLine('全ページで表示します。'));
+    } else {
+      scope.enabledPaths.forEach((rule, index) => {
+        list.appendChild(createScopeRuleItem(
+          rule.type === 'prefix' ? 'この階層以下' : 'このページだけ',
+          rule.value,
+          () => {
+            const nextPaths = scope.enabledPaths.filter((_rule, ruleIndex) => ruleIndex !== index);
+            writeCurrentSiteScope({ ...scope, enabledPaths: nextPaths });
+            siteScopeMessage = 'ページ条件を削除しました。';
+            renderManager();
+          }
+        ));
+      });
+    }
+
+    block.appendChild(head);
+    block.appendChild(actions);
+    block.appendChild(list);
+    return block;
+  }
+
+  function createFieldScopeBlock(scope) {
+    const block = document.createElement('div');
+    block.className = 'mac-scope-block';
+
+    const head = document.createElement('div');
+    head.className = 'mac-scope-head';
+
+    const title = document.createElement('div');
+    title.className = 'mac-scope-title';
+    title.textContent = `対象入力欄: ${scope.fieldSelectors.length ? `${scope.fieldSelectors.length.toLocaleString('ja-JP')}件指定` : '全入力欄'}`;
+
+    const clearButton = document.createElement('button');
+    clearButton.type = 'button';
+    clearButton.className = 'mac-danger';
+    clearButton.textContent = '入力欄指定をクリア';
+    clearButton.disabled = !scope.fieldSelectors.length;
+    clearButton.addEventListener('click', () => {
+      writeCurrentSiteScope({ ...scope, fieldSelectors: [] });
+      siteScopeMessage = '入力欄指定をクリアしました。';
+      renderManager();
+    });
+
+    head.appendChild(title);
+    head.appendChild(clearButton);
+
+    const actions = document.createElement('div');
+    actions.className = 'mac-manager-row';
+
+    const lastFieldButton = document.createElement('button');
+    lastFieldButton.type = 'button';
+    lastFieldButton.textContent = '直前にクリックした入力欄を追加';
+    lastFieldButton.disabled = !canUseLastFocusedTextEntry();
+    lastFieldButton.addEventListener('click', () => {
+      addFieldSelectorForElement(lastFocusedTextEntry);
+    });
+
+    const pickerButton = document.createElement('button');
+    pickerButton.type = 'button';
+    pickerButton.textContent = managerFieldPickerOpen ? '入力欄一覧を閉じる' : 'このページの入力欄から選ぶ';
+    pickerButton.addEventListener('click', () => {
+      managerFieldPickerOpen = !managerFieldPickerOpen;
+      renderManagerPreservingScroll();
+    });
+
+    actions.appendChild(lastFieldButton);
+    actions.appendChild(pickerButton);
+
+    const list = document.createElement('div');
+    list.className = 'mac-rule-list';
+    if (!scope.fieldSelectors.length) {
+      list.appendChild(emptyLine('全入力欄で表示します。'));
+    } else {
+      scope.fieldSelectors.forEach((field, index) => {
+        list.appendChild(createScopeRuleItem(field.label, field.selector, () => {
+          const nextFields = scope.fieldSelectors.filter((_field, fieldIndex) => fieldIndex !== index);
+          writeCurrentSiteScope({ ...scope, fieldSelectors: nextFields });
+          siteScopeMessage = '入力欄条件を削除しました。';
+          renderManagerPreservingScroll();
+        }));
+      });
+    }
+
+    block.appendChild(head);
+    block.appendChild(actions);
+    block.appendChild(list);
+
+    if (managerFieldPickerOpen) {
+      block.appendChild(createFieldPickerList(scope));
+    }
+
+    return block;
+  }
+
+  function createFieldPickerList(scope) {
+    const list = document.createElement('div');
+    list.className = 'mac-rule-list';
+
+    const entries = collectPageTextEntries();
+    if (!entries.length) {
+      list.appendChild(emptyLine('このページに選択できる入力欄が見つかりません。'));
+      return list;
+    }
+
+    entries.forEach((entry) => {
+      list.appendChild(createDetectedFieldItem(entry, scope));
+    });
+    return list;
+  }
+
+  function createDetectedFieldItem(element, scope) {
+    const item = document.createElement('div');
+    item.className = 'mac-rule-item';
+
+    const field = buildFieldSelectorForElement(element);
+    const text = document.createElement('div');
+
+    const name = document.createElement('div');
+    name.className = 'mac-rule-name';
+    name.textContent = field.label;
+
+    const meta = document.createElement('div');
+    meta.className = 'mac-rule-meta';
+    meta.textContent = field.selector;
+
+    text.appendChild(name);
+    text.appendChild(meta);
+
+    const exists = scope.fieldSelectors.some((current) => current.selector === field.selector);
+    const addButton = document.createElement('button');
+    addButton.type = 'button';
+    addButton.textContent = exists ? '追加済み' : '追加';
+    addButton.disabled = exists;
+    addButton.addEventListener('click', () => {
+      addFieldSelector(field);
+    });
+
+    item.appendChild(text);
+    item.appendChild(addButton);
+    return item;
+  }
+
+  function createScopeRuleItem(nameText, metaText, onDelete) {
+    const item = document.createElement('div');
+    item.className = 'mac-rule-item';
+
+    const text = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'mac-rule-name';
+    name.textContent = nameText;
+
+    const meta = document.createElement('div');
+    meta.className = 'mac-rule-meta';
+    meta.textContent = metaText;
+
+    text.appendChild(name);
+    text.appendChild(meta);
+
+    const deleteButton = document.createElement('button');
+    deleteButton.type = 'button';
+    deleteButton.className = 'mac-danger';
+    deleteButton.textContent = '削除';
+    deleteButton.addEventListener('click', onDelete);
+
+    item.appendChild(text);
+    item.appendChild(deleteButton);
+    return item;
   }
 
   function createModeSection() {
@@ -3270,7 +4033,7 @@
   function findActionTextEntries(trigger) {
     const result = [];
     const add = (entry) => {
-      if (!entry || !isTextEntry(entry) || result.includes(entry)) return;
+      if (!entry || !isAutocompleteTarget(entry) || result.includes(entry)) return;
       if (normalize(getEntryValue(entry)).length < MIN_RECORD_LENGTH) return;
       result.push(entry);
     };
